@@ -13,7 +13,7 @@ WORKDIR /app
 COPY . /app
 
 # Make scripts executable
-RUN chmod +x /app/serve_classifier.sh /app/serve_libraire.sh
+RUN chmod +x /app/serve_indexer.sh /app/serve_repo_chat.sh
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r /app/requirements.txt

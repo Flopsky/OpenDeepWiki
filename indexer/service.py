@@ -8,6 +8,7 @@ from src.schemas.description import (
     TemplateManager,
     generate_code_structure_model_consize,
     DocumentCompression,
+    YamlBrief,
 )
 from src.schemas.classif import create_file_classification
 from .utils import list_all_files, SAFE
@@ -15,12 +16,11 @@ import instructor
 import os
 import dotenv
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import concurrent.futures
+import asyncio
 import google.generativeai as genai
 import logging
 import traceback
-from app.services.monitor.langfuse import get_langfuse_context,trace,generate_trace_id
+from src.monitor.langfuse import get_langfuse_context,trace,generate_trace_id
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -54,7 +54,7 @@ class ClassifierNode(ClassifierConfig):
     def __init__(self):
         super().__init__()
 
-    def process_batch(
+    async def process_batch(
         self,
         file_batch: list[str],
         client_gemini,
@@ -62,7 +62,7 @@ class ClassifierNode(ClassifierConfig):
         symstem_prompt: str,
         user_prompt: str,
         scores: list[int],
-    span=None,
+        span=None,
     ) -> dict:
         """Process a batch of files using Gemini API"""
         batch_prompt = user_prompt + "\n" + f"{file_batch}"
@@ -72,7 +72,6 @@ class ClassifierNode(ClassifierConfig):
             {"role": "user", "content": batch_prompt},
         ]
 
-        # Simulate a delay with random jitter
         if span:
             generation = span.generation(
                 name="gemini",
@@ -82,20 +81,22 @@ class ClassifierNode(ClassifierConfig):
             )
 
         try:
-            completion, raw = client_gemini.chat.create_with_completion(
-                messages=messages,
-                response_model=create_file_classification(file_batch, scores),
-                generation_config={
-                    "temperature": 0.0,
-                    "top_p": 1,
-                    "candidate_count": 1,
-                    "max_output_tokens": 8000,
-                },
-                max_retries=10,
+            # Run the blocking call in a thread pool to avoid blocking the event loop
+            completion, raw = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: client_gemini.chat.create_with_completion(
+                    messages=messages,
+                    response_model=create_file_classification(file_batch, scores),
+                    generation_config={
+                        "temperature": 0.0,
+                        "top_p": 1,
+                        "candidate_count": 1,
+                        "max_output_tokens": 8000,
+                    },
+                    max_retries=10,
+                )
             )
             result = completion.model_dump()
-            # if span:
-            #     span.score(name="number_try", value=raw.n_attempts)
 
         except Exception as e:
             if span:
@@ -118,7 +119,7 @@ class ClassifierNode(ClassifierConfig):
         return result
 
     @trace
-    def llmclassifier(
+    async def llmclassifier(
         self,
         folder_path: str,
         batch_size: int = 50,  # Number of files to process in each batch
@@ -173,8 +174,6 @@ class ClassifierNode(ClassifierConfig):
             2: self.file_class_model_2,
         }
         
-        
-
         # Get file names
         files_structure = list_all_files(folder_path, include_md=True)
 
@@ -188,37 +187,41 @@ class ClassifierNode(ClassifierConfig):
 
         all_results = {"file_classifications": []}
 
-        # Process batches in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_batch = {
-                executor.submit(
-                    self.process_batch,
-                    batch,
-                    clients[index % 3],
-                    model_names[index % 3],
-                    self.prompts_config["system_classification"],
-                    self.prompts_config["user_classification"],
-                    scores,
-                    span,
-                ): batch
-                for index, batch in enumerate(batches)
-            }
+        # Process batches in parallel using asyncio
+        tasks = []
+        for index, batch in enumerate(batches):
+            task = self.process_batch(
+                batch,
+                clients[index % 3],
+                model_names[index % 3],
+                self.prompts_config["system_classification"],
+                self.prompts_config["user_classification"],
+                scores,
+                span,
+            )
+            tasks.append(task)
 
-            for future in as_completed(future_to_batch):
-                try:
-                    result = future.result()
-                    all_results["file_classifications"].extend(
-                        result.get("file_classifications", [])
-                    )
-                except Exception as e:
-                    raise Exception(f"Batch processing failed: {str(e)}, {traceback.format_exc()}")
+        # Use asyncio.gather with semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(max_workers)
+        
+        async def bounded_task(task):
+            async with semaphore:
+                return await task
 
+        bounded_tasks = [bounded_task(task) for task in tasks]
+        
+        try:
+            results = await asyncio.gather(*bounded_tasks)
+            for result in results:
+                all_results["file_classifications"].extend(
+                    result.get("file_classifications", [])
+                )
+        except Exception as e:
+            raise Exception(f"Batch processing failed: {str(e)}, {traceback.format_exc()}")
 
         # replace file_name by fileç_path
         for classification in all_results["file_classifications"]:
             classification["file_paths"] = files_paths[classification["file_id"]]
-
-        # Combine all results
 
         return all_results
 
@@ -227,7 +230,7 @@ class InformationCompressorNode(ClassifierConfig):
     def __init__(self):
         super().__init__()
     
-    def process_batch(
+    async def process_batch(
         self,
         file_batch: str,
         client_gemini,
@@ -254,10 +257,6 @@ class InformationCompressorNode(ClassifierConfig):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": batch_prompt},
         ]
-
-        # Simulate a delay with random jitter - Moved outside the retry loop
-        # delay = random.uniform(0.1, 0.5)
-        # time.sleep(delay) # Consider if this delay is still needed with timeouts
 
         if log_name == "docstring":
             pydantic_model = generate_code_structure_model_consize(batch_prompt)
@@ -289,23 +288,24 @@ class InformationCompressorNode(ClassifierConfig):
         for attempt, (current_client, current_model_name) in enumerate(clients_to_try):
             print(f"Attempt {attempt + 1}/{len(clients_to_try)} for file {file_batch} using model {current_model_name}...")
             try:
-                # Function to run the API call, needed for ThreadPoolExecutor
-                def api_call_task():
-                    return current_client.chat.create_with_completion(
-                        messages=messages,
-                        response_model=pydantic_model,
-                        generation_config={
-                            "temperature": 0.0,
-                            "top_p": 1,
-                            "candidate_count": 1,
-                            "max_output_tokens": 8000,
-                        },
-                        max_retries=1, # Reduced internal retries as we have our own loop
+                # Use asyncio.wait_for for timeout instead of ThreadPoolExecutor
+                async def api_call_task():
+                    return await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: current_client.chat.create_with_completion(
+                            messages=messages,
+                            response_model=pydantic_model,
+                            generation_config={
+                                "temperature": 0.0,
+                                "top_p": 1,
+                                "candidate_count": 1,
+                                "max_output_tokens": 8000,
+                            },
+                            max_retries=1, # Reduced internal retries as we have our own loop
+                        )
                     )
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(api_call_task)
-                    completion, raw = future.result(timeout=15) # 15-second timeout
+                completion, raw = await asyncio.wait_for(api_call_task(), timeout=15.0)
 
                 # --- Success ---
                 result = completion.model_dump()
@@ -324,10 +324,10 @@ class InformationCompressorNode(ClassifierConfig):
                     )
                 return result, index
 
-            except concurrent.futures.TimeoutError:
+            except asyncio.TimeoutError:
                 last_status_message = f"Attempt {attempt + 1} timed out after 15s (Model: {current_model_name})"
                 print(last_status_message)
-                last_exception = concurrent.futures.TimeoutError(last_status_message) # Store exception type
+                last_exception = asyncio.TimeoutError(last_status_message) # Store exception type
 
             except Exception as e:
                 last_status_message = f"Attempt {attempt + 1} failed (Model: {current_model_name}): {str(e)}, {traceback.format_exc()}"
@@ -350,7 +350,7 @@ class InformationCompressorNode(ClassifierConfig):
         return None, None
 
     @trace
-    def summerizer(
+    async def summerizer(
         self,
         classified_files: dict,
         batch_size: int = 50,  # Number of files to process in each batch
@@ -411,7 +411,6 @@ class InformationCompressorNode(ClassifierConfig):
             3: self.file_class_model_3,
         }
 
-
         # Prepare file lists for each category
         files_structure_docstring = []
         files_structure_documentation = []
@@ -433,7 +432,6 @@ class InformationCompressorNode(ClassifierConfig):
             elif ".yaml" in file_path.lower() or ".yml" in file_path.lower() or ".yml" in file_name:
                 files_structure_config.append([file_path, "config"])
 
-
         # Combine all files to process
         all_files_to_process = files_structure_docstring + files_structure_documentation + files_structure_config
 
@@ -442,58 +440,75 @@ class InformationCompressorNode(ClassifierConfig):
         results_documentation = {}
         results_config = {}
 
-        # Process all batches in parallel using a single ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {}
-            for i, (file_path, category) in enumerate(all_files_to_process):
-                client_index = i % 4
-                model_name = model_names[client_index]
-                client = clients[client_index]
-                fallback_clients = [clients[j] for j in range(4) if j != client_index]
-                fallback_model_names = [model_names[j] for j in range(4) if j != client_index]
-                if category == "docstring":
-                    system_prompt = self.prompts_config["system_docstring"]
-                    user_prompt = self.prompts_config["user_docstring"]
-                    log_name = "docstring"
-                elif category == "documentation":
-                    system_prompt = self.prompts_config["system_documentation"]
-                    user_prompt = self.prompts_config["user_documentation"]
-                    log_name = "documentation"
-                else: # category == "config"
-                    system_prompt = self.prompts_config["system_configuration"]
-                    user_prompt = self.prompts_config["user_configuration"]
-                    log_name = "config"
+        # Create tasks for all files
+        tasks = []
+        file_to_category = {}
+        
+        for i, (file_path, category) in enumerate(all_files_to_process):
+            client_index = i % 4
+            model_name = model_names[client_index]
+            client = clients[client_index]
+            fallback_clients = [clients[j] for j in range(4) if j != client_index]
+            fallback_model_names = [model_names[j] for j in range(4) if j != client_index]
+            
+            if category == "docstring":
+                system_prompt = self.prompts_config["system_docstring"]
+                user_prompt = self.prompts_config["user_docstring"]
+                log_name = "docstring"
+            elif category == "documentation":
+                system_prompt = self.prompts_config["system_documentation"]
+                user_prompt = self.prompts_config["user_documentation"]
+                log_name = "documentation"
+            else: # category == "config"
+                system_prompt = self.prompts_config["system_configuration"]
+                user_prompt = self.prompts_config["user_configuration"]
+                log_name = "config"
 
-                future = executor.submit(
-                    self.process_batch,
-                    file_path,
-                    client,
-                    model_name,
-                    system_prompt,
-                    user_prompt,
-                    scores,
-                    span,
-                    file_path, # Pass file_path as identifier instead of original index
-                    log_name=log_name,
-                    fallback_clients=fallback_clients,
-                    fallback_model_names=fallback_model_names,
-                )
-                future_to_file[future] = (file_path, category)
+            task = self.process_batch(
+                file_path,
+                client,
+                model_name,
+                system_prompt,
+                user_prompt,
+                scores,
+                span,
+                file_path, # Pass file_path as identifier instead of original index
+                log_name=log_name,
+                fallback_clients=fallback_clients,
+                fallback_model_names=fallback_model_names,
+            )
+            tasks.append(task)
+            file_to_category[i] = (file_path, category)
 
-            for future in as_completed(future_to_file):
-                file_path, category = future_to_file[future]
-                try:
-                    result, identifier = future.result() # identifier is file_path here
-                    if result and identifier == file_path: # Check if result is valid and matches the file path
-                        if category == "docstring":
-                            results_docstring[file_path] = result
-                        elif category == "documentation":
-                            results_documentation[file_path] = result
-                        elif category == "config":
-                            results_config[file_path] = result
-                except Exception as e:
-                    print(f"Batch processing failed for {file_path} ({category}): {str(e)}", {traceback.format_exc()})
+        # Use asyncio.gather with semaphore to limit concurrency
+        semaphore = asyncio.Semaphore(max_workers)
+        
+        async def bounded_task(task):
+            async with semaphore:
+                return await task
 
+        bounded_tasks = [bounded_task(task) for task in tasks]
+        
+        try:
+            results = await asyncio.gather(*bounded_tasks, return_exceptions=True)
+            
+            for i, result in enumerate(results):
+                file_path, category = file_to_category[i]
+                if isinstance(result, Exception):
+                    print(f"Batch processing failed for {file_path} ({category}): {str(result)}")
+                    continue
+                    
+                processed_result, identifier = result
+                if processed_result and identifier == file_path: # Check if result is valid and matches the file path
+                    if category == "docstring":
+                        results_docstring[file_path] = processed_result
+                    elif category == "documentation":
+                        results_documentation[file_path] = processed_result
+                    elif category == "config":
+                        results_config[file_path] = processed_result
+                        
+        except Exception as e:
+            print(f"Error in asyncio.gather: {str(e)}, {traceback.format_exc()}")
 
         # Structure the final output
         output_documentation = []
@@ -532,12 +547,6 @@ class InformationCompressorNode(ClassifierConfig):
                 output_config.append(file_data)
                 processed_indices.add(original_index)
 
-        # Add any remaining files that weren't processed (e.g., excluded ipynb, init.py)
-        # This part might need adjustment based on desired behavior for unprocessed files.
-        # Currently, they are implicitly excluded from the output lists.
-        # If they need to be included in one of the lists without documentation, add logic here.
-
-
         return {
             "documentation": output_documentation,
             "documentation_md": output_documentation_md,
@@ -551,10 +560,10 @@ class ClassifierService:
         self.classifier_node = ClassifierNode()
         self.information_compressor_node = InformationCompressorNode()
         self.trace_id = generate_trace_id()
-    def run_pipeline(self, folder_path: str, batch_size: int = 50, max_workers: int = 10, GEMINI_API_KEY: str = "", ANTHROPIC_API_KEY: str = "", OPENAI_API_KEY: str = ""):
+        
+    async def run_pipeline(self, folder_path: str, batch_size: int = 50, max_workers: int = 10, GEMINI_API_KEY: str = "", ANTHROPIC_API_KEY: str = "", OPENAI_API_KEY: str = ""):
         # Classifier Node
-        # Classifier Node
-        classifier_result = self.classifier_node.llmclassifier(
+        classifier_result = await self.classifier_node.llmclassifier(
             folder_path, 
             batch_size, 
             max_workers, 
@@ -564,7 +573,7 @@ class ClassifierService:
             trace_id=self.trace_id 
         )
         # Information Compressor Node
-        information_compressor_result = self.information_compressor_node.summerizer(
+        information_compressor_result = await self.information_compressor_node.summerizer(
             classifier_result, 
             batch_size, 
             max_workers, 
@@ -574,13 +583,15 @@ class ClassifierService:
             trace_id=self.trace_id  # Pass trace_id explicitly
         )
         return information_compressor_result
-    
 
 
 
 
 # test
 if __name__ == "__main__":
-    classifier_service = ClassifierService()
-    result = classifier_service.run_pipeline("/Users/davidperso/projects/deepgithub/backend/app",GEMINI_API_KEY=os.getenv("GEMINI_API_KEY"))
-    print(result)
+    async def main():
+        classifier_service = ClassifierService()
+        result = await classifier_service.run_pipeline("/Users/davidperso/projects/deepgithub/backend/app",GEMINI_API_KEY=os.getenv("GEMINI_API_KEY"))
+        print(result)
+    
+    asyncio.run(main())

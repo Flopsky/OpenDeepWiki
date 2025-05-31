@@ -177,6 +177,12 @@ def process_repo_link(link: str, gemini_api_key=None):
     documentation_path = f"docstrings_json/{display_name}.json"
     documentation_md_path = f"ducomentations_json/{display_name}.json"
     config_path = f"configs_json/{display_name}.json"
+    
+    # Ensure parent directories exist
+    Path(documentation_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(documentation_md_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(config_path).parent.mkdir(parents=True, exist_ok=True)
+    
     repo_path = clone_github_repo("repository_folder", link)
 
     system_prompt = """
@@ -215,7 +221,9 @@ Your task is to answer any question related to the documentation of the python r
         logger.info(f"Using GEMINI_API_KEY: {api_key_preview}... (length: {len(gemini_api_key) if gemini_api_key else 0})")
         
         payload = {
-            "repo_local_path": str(repo_path), 
+            "folder_path": str(repo_path), 
+            "batch_size": 50,
+            "max_workers": 10,
             "GEMINI_API_KEY": gemini_api_key,
             "ANTHROPIC_API_KEY": "",
             "OPENAI_API_KEY": ""
@@ -224,7 +232,8 @@ Your task is to answer any question related to the documentation of the python r
         response = requests.post(url_file_classification, json=payload) # Use repo_path directly
         if response.status_code != 200:
             raise Exception("Failed to get documentation from the server.")
-        response = response.json()
+        response_data = response.json()
+        response = response_data["result"]
 
         documentation_json = {"documentation": response["documentation"]}
         documentation_md_json = {"documentation_md": response["documentation_md"]}
@@ -305,7 +314,9 @@ Your task is to answer any question related to the documentation of the python r
         logger.info(f"Using GEMINI_API_KEY: {api_key_preview}... (length: {len(gemini_api_key) if gemini_api_key else 0})")
         
         payload = {
-            "repo_local_path": str(repo_path), 
+            "folder_path": str(repo_path), 
+            "batch_size": 50,
+            "max_workers": 10,
             "GEMINI_API_KEY": gemini_api_key,
             "ANTHROPIC_API_KEY": "",
             "OPENAI_API_KEY": ""
@@ -327,11 +338,11 @@ Your task is to answer any question related to the documentation of the python r
 
         response_data = response.json()
         logger.info(f"Received response from classifier: {response_data}")
+        response = response_data["result"]
 
-
-        documentation_json = {"documentation": response_data.get("documentation", {})}
-        documentation_md_json = {"documentation_md": response_data.get("documentation_md", "")}
-        config_json = {"config": response_data.get("config", {})}
+        documentation_json = {"documentation": response.get("documentation", {})}
+        documentation_md_json = {"documentation_md": response.get("documentation_md", "")}
+        config_json = {"config": response.get("config", {})}
 
 
         # Save the generated data
@@ -355,41 +366,6 @@ Your task is to answer any question related to the documentation of the python r
     return cache_name
 
 
-# def process_repo_link(link : str):
-#     display_name = link.split('/')[-1]
-#     repo_path = clone_github_repo("repository_folder",link)
-
-#     system_prompt = """
-# # Context
-# You are an expert Software developer with a deep understanding of the software development lifecycle, including requirements gathering, design, implementation, testing, and deployment.
-# Your task is to answer any question related to the documentation of the python repository repository_name that you have in your context.
-
-
-# """.replace("repository_name",display_name)
-
-
-#     url_file_classification = "http://localhost:8002/score"
-
-#     #get the documentation json from the fastapi documentation generation server
-#     response = requests.post(
-#         url_file_classification,
-#         json={
-#             "repo_local_path": repo_path
-#         }
-#     )
-#     if response.status_code != 200:
-#         raise Exception("Failed to get documentation from the server.")
-
-#     documentation_json = response.json()
-
-#     with open(f'docstrings_json/{display_name}.json', 'w') as f:
-#         json.dump(response.json(), f)
-
-#     documentation_str = str(documentation_json)
-
-#     cache_name = create_cache(display_name,documentation_str,system_prompt)
-
-#     return cache_name
 
 
 def get_file_hash(file_path: Path) -> str:
@@ -561,18 +537,31 @@ Your task is to answer any question related to the documentation of the python r
             url_file_classification = "http://localhost:8002/score"
             logger.info(f"Calling classifier service for updated repo at {existing_repo_path}")
             response = requests.post(
-                url_file_classification, json={"repo_local_path": str(existing_repo_path), "gemini_api_key": gemini_api_key} # Use the path in the shared volume
+                url_file_classification, json={
+                    "folder_path": str(existing_repo_path), 
+                    "batch_size": 50,
+                    "max_workers": 10,
+                    "GEMINI_API_KEY": gemini_api_key,
+                    "ANTHROPIC_API_KEY": "",
+                    "OPENAI_API_KEY": ""
+                } # Use the path in the shared volume
             )
             
             if response.status_code != 200:
                 raise Exception(f"Classifier service failed with status {response.status_code}.")
                 
-            response_data = response.json()
+            response_result = response.json()
+            response_data = response_result["result"]
             
             # Load existing JSON files using absolute paths
             documentation_path = Path(f"/app/docstrings_json/{repo_name}.json")
             documentation_md_path = Path(f"/app/ducomentations_json/{repo_name}.json")
             config_path = Path(f"/app/configs_json/{repo_name}.json")
+            
+            # Ensure parent directories exist
+            documentation_path.parent.mkdir(parents=True, exist_ok=True)
+            documentation_md_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.parent.mkdir(parents=True, exist_ok=True)
             
             with open(documentation_path, "r") as f1:
                 documentation_json = json.load(f1)

@@ -12,10 +12,6 @@ import instructor
 import os
 import dotenv
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict
 import json
 import instructor
 from google.generativeai import caching
@@ -565,7 +561,7 @@ class Librairie_Service(ClassifierConfig):
         # 9. prompts for final answer
         prompt_user_code_generator_output = self.template_manager.render_template(
             template_relative_path=self.prompts_config["user_prompt_code_generator"],
-            context={"user_problem": querry_rewriter_output}
+            context={"user_problem": user_problem}
         )
         prompt_system_code_generator_output = self.template_manager.render_template(
             template_relative_path=self.prompts_config["system_prompt_code_generator"],

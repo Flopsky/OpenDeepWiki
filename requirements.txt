@@ -1,5 +1,3 @@
-promptflow-tools
-promptflow>=1.8.0
 instructor==1.6.3
 pydantic==2.9.2
 tenacity==9.0.0
@@ -11,3 +9,7 @@ uvicorn
 streamlit
 gradio>=5.0.2
 anthropic
+fastapi
+flask
+dotenv
+flask_cors
