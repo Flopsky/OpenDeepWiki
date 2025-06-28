@@ -22,7 +22,7 @@ from openai import OpenAI
 import aiofiles
 import logging
 import traceback
-from src.monitor.langfuse import get_langfuse_context, trace, generate_trace_id
+from src.monitor import trace, generate_trace_id, get_langfuse_context, should_trace
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -599,7 +599,7 @@ class ClassifierService:
         self.information_compressor_node = InformationCompressorNode()
         self.trace_id = generate_trace_id()
         
-    async def run_pipeline(self, folder_path: str, batch_size: int = 10, max_workers: int = 100, GEMINI_API_KEY: str = "", ANTHROPIC_API_KEY: str = "", OPENAI_API_KEY: str = ""):
+    async def run_pipeline(self, folder_path: str, batch_size: int = 40, max_workers: int = 100, GEMINI_API_KEY: str = "", ANTHROPIC_API_KEY: str = "", OPENAI_API_KEY: str = ""):
         trace_id = generate_trace_id()
         # Classifier Node
         classifier_result = await self.classifier_node.llmclassifier(

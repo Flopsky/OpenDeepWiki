@@ -290,9 +290,14 @@ def upload_repo():
             openai_api_key = request.form.get('OPENAI_API_KEY', '')
             controller_logger.info(f"Received OPENAI_API_KEY for upload: {openai_api_key[:5] + '...' if openai_api_key and len(openai_api_key) > 5 else openai_api_key} (length: {len(openai_api_key) if openai_api_key else 0})")
             
-            repo_params, message = handle_zip_upload(temp_path, gemini_api_key, openai_api_key) # from src.core.init_repo
+            # handle_zip_upload is a generator, so we need to iterate through it
+            repo_params = None
+            message = None
+            for result in handle_zip_upload(temp_path, gemini_api_key, openai_api_key):
+                repo_params, message = result
+                controller_logger.info(f"handle_zip_upload progress: {message}")
             
-            controller_logger.info(f"handle_zip_upload yielded: {repo_params}, {message}")
+            controller_logger.info(f"handle_zip_upload final result: {repo_params}, {message}")
             
             # Add to session
             session_id = get_session_id()
