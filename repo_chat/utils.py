@@ -85,7 +85,8 @@ client_pro = genai.GenerativeModel(
 client_25pro_preview = genai.GenerativeModel(
     model_name="gemini-2.5-pro-preview-03-25",
     safety_settings=safe,
-    generation_config={"temperature": 0.95, "top_p": 1, "max_output_tokens": 60000},
+    # Lower max_output_tokens for faster responses by default; callers can override
+    generation_config={"temperature": 0.3, "top_p": 1, "max_output_tokens": 60000},
 )
 
 def get_gemini_pro_25_response(prompt: str) -> str:

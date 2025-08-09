@@ -1,10 +1,26 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { FiSend, FiLoader, FiPlus, FiPaperclip } from 'react-icons/fi';
+import { FiArrowUp, FiLoader, FiPlus, FiPaperclip } from 'react-icons/fi';
 
-const ChatInput = ({ onSendMessage, disabled, placeholder, isLoading }) => {
+const ChatInput = ({ onSendMessage, disabled, placeholder, isLoading, draftKey = 'chat_draft', inline = false }) => {
   const [message, setMessage] = useState('');
   const [isFocused, setIsFocused] = useState(false);
   const textareaRef = useRef(null);
+  const formRef = useRef(null);
+  
+  // Restore draft per-conversation
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(draftKey);
+      if (saved) setMessage(saved);
+    } catch {}
+  }, [draftKey]);
+  
+  // Persist draft per-conversation
+  useEffect(() => {
+    try {
+      localStorage.setItem(draftKey, message);
+    } catch {}
+  }, [message, draftKey]);
   
   // Auto-resize textarea based on content
   useEffect(() => {
@@ -19,6 +35,7 @@ const ChatInput = ({ onSendMessage, disabled, placeholder, isLoading }) => {
     if (message.trim() && !disabled && !isLoading) {
       onSendMessage(message);
       setMessage('');
+      try { localStorage.removeItem(draftKey); } catch {}
       
       // Reset textarea height
       if (textareaRef.current) {
@@ -46,19 +63,9 @@ const ChatInput = ({ onSendMessage, disabled, placeholder, isLoading }) => {
   const isMessageValid = message.trim().length > 0;
   
   return (
-    <div className="input-container">
+    <div className={`input-container ${inline ? 'inline' : ''}`} role="form" aria-label="Chat input area">
       <div className="input-wrapper">
-        <form className="input-form" onSubmit={handleSubmit}>
-          <button 
-            className="input-button attachment-button"
-            type="button" 
-            disabled={disabled}
-            aria-label="Add attachment"
-            title="Add attachment (Coming soon)"
-            style={{ opacity: 0.5 }} // Temporarily disabled
-          >
-            <FiPaperclip size={16} />
-          </button>
+        <form ref={formRef} className="input-form" onSubmit={handleSubmit}>
           
           <textarea
             className="input-textarea"
@@ -75,6 +82,7 @@ const ChatInput = ({ onSendMessage, disabled, placeholder, isLoading }) => {
               borderRadius: '1rem',
               transition: 'all 0.15s ease-out',
             }}
+            aria-label="Message opendeepwiki"
           />
           
           <button 
@@ -91,16 +99,10 @@ const ChatInput = ({ onSendMessage, disabled, placeholder, isLoading }) => {
             {isLoading ? (
               <FiLoader size={16} className="loading-icon" />
             ) : (
-              <FiSend size={16} />
+              <FiArrowUp size={16} />
             )}
           </button>
         </form>
-      </div>
-      
-      <div className="input-footer">
-        <span style={{ opacity: 0.7 }}>
-          opendeepwiki can make mistakes. Consider checking important information.
-        </span>
       </div>
     </div>
   );

@@ -29,7 +29,14 @@ class TemplateManager:
         if not full_template_relative_path.exists():
             raise FileNotFoundError(f"Template file not found: {full_template_relative_path} (resolved from base {self.default_search_dir})")
 
-        env = Environment(loader=FileSystemLoader(searchpath=str(template_dir_for_loader)))
+        # Cache the Jinja2 environment per directory to avoid re-creating on each render
+        if not hasattr(self, "_env_cache"):
+            self._env_cache = {}
+        cache_key = str(template_dir_for_loader)
+        env = self._env_cache.get(cache_key)
+        if env is None:
+            env = Environment(loader=FileSystemLoader(searchpath=str(template_dir_for_loader)))
+            self._env_cache[cache_key] = env
         template = env.get_template(template_file_name)
         return template.render(context)
 

@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import logging
 from .service import ClassifierService
 import traceback
+import asyncio
 
 app = FastAPI(title="Indexer Service", description="File classification and summarization service")
 
@@ -33,13 +34,14 @@ async def classify_files(request: ClassificationRequest):
     try:
         logger.info(f"Received classification request for folder: {request.folder_path}")
         
+        # Run the async pipeline directly; it uses async + executors internally
         result = await classifier_service.run_pipeline(
             folder_path=request.folder_path,
             batch_size=request.batch_size,
             max_workers=request.max_workers,
             GEMINI_API_KEY=request.GEMINI_API_KEY,
             ANTHROPIC_API_KEY=request.ANTHROPIC_API_KEY,
-            OPENAI_API_KEY=request.OPENAI_API_KEY
+            OPENAI_API_KEY=request.OPENAI_API_KEY,
         )
         
         logger.info("Classification completed successfully")
@@ -57,4 +59,4 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8002) 
+    uvicorn.run(app, host="0.0.0.0", port=8002, loop="uvloop", http="httptools")

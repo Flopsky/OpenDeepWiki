@@ -4,10 +4,12 @@ from typing import Dict, Any, List
 import logging
 from .service import Librairie_Service
 import traceback
+import asyncio
 
 app = FastAPI(title="Libraire Service", description="Documentation retrieval and response generation service")
 
 # Configure logging
+# Use uvicorn's structured logs in prod; keep INFO level
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -47,17 +49,19 @@ async def process_libraire_request(request: LibraireRequest):
     try:
         logger.info(f"Received libraire request for repository: {request.repository_name}")
         
-        result = repo_chat.run_pipeline(
-            repository_name=request.repository_name,
-            cache_id=request.cache_id,
-            documentation=request.documentation,
-            user_problem=request.user_problem,
-            documentation_md=request.documentation_md,
-            config_input=request.config,
-            model_name=request.model_name,
-            GEMINI_API_KEY=request.GEMINI_API_KEY,
-            ANTHROPIC_API_KEY=request.ANTHROPIC_API_KEY,
-            OPENAI_API_KEY=request.OPENAI_API_KEY
+        # Offload blocking pipeline to a thread to avoid blocking the event loop
+        result = await asyncio.to_thread(
+            repo_chat.run_pipeline,
+            request.repository_name,
+            request.cache_id,
+            request.documentation,
+            request.user_problem,
+            request.documentation_md,
+            request.config,
+            request.GEMINI_API_KEY,
+            request.ANTHROPIC_API_KEY,
+            request.OPENAI_API_KEY,
+            request.model_name,
         )
         
         logger.info("Libraire processing completed successfully")
@@ -104,13 +108,15 @@ async def process_multi_repo_request(request: MultiRepoRequest):
         # Use the new multi-repository pipeline that makes only one call to Final Response Generator
         logger.info(f"Calling multi-repository pipeline with {len(repositories_data)} repositories")
         
-        aggregated_response = repo_chat.run_multi_repo_pipeline(
-            repositories_data=repositories_data,
-            user_problem=request.user_problem,
-            model_name=request.model_name,
-            GEMINI_API_KEY=request.GEMINI_API_KEY,
-            ANTHROPIC_API_KEY=request.ANTHROPIC_API_KEY,
-            OPENAI_API_KEY=request.OPENAI_API_KEY
+        # Offload blocking multi-repo pipeline to a thread
+        aggregated_response = await asyncio.to_thread(
+            repo_chat.run_multi_repo_pipeline,
+            repositories_data,
+            request.user_problem,
+            request.GEMINI_API_KEY,
+            request.ANTHROPIC_API_KEY,
+            request.OPENAI_API_KEY,
+            request.model_name,
         )
         
         logger.info("Multi-repo processing completed successfully")
@@ -131,4 +137,5 @@ async def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001) 
+    # Use faster loop/http if available
+    uvicorn.run(app, host="0.0.0.0", port=8001, loop="uvloop", http="httptools")

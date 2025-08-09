@@ -4,6 +4,7 @@ from google.generativeai import caching
 import google.api_core.exceptions as exceptions
 import datetime
 import requests
+import requests.adapters
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -33,6 +34,12 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Default configuration with environment variable
 genai.configure(api_key=GEMINI_API_KEY)
+
+# Global HTTP session with connection pooling for local service calls
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=100, max_retries=2)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
 
 # Function to configure API with a specific key
 def configure_gemini_api(api_key=None):
@@ -289,7 +296,7 @@ Your task is to answer any question related to the documentation of the python r
             "OPENAI_API_KEY": openai_api_key or ""
         }
         
-        response = requests.post(url_file_classification, json=payload) # Use repo_path directly
+        response = _session.post(url_file_classification, json=payload)#, timeout=90) # Use repo_path directly
         if response.status_code != 200:
             raise Exception("Failed to get documentation from the server.")
         response_data = response.json()
@@ -383,7 +390,7 @@ Your task is to answer any question related to the documentation of the python r
         }
         
         try:
-            response = requests.post(url_file_classification, json=payload)
+            response = _session.post(url_file_classification, json=payload)#, timeout=90)
             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to connect to classifier service: {e}")
@@ -596,15 +603,15 @@ Your task is to answer any question related to the documentation of the python r
             # Call classifier on the updated repository in the shared volume
             url_file_classification = "http://localhost:8002/score"
             logger.info(f"Calling classifier service for updated repo at {existing_repo_path}")
-            response = requests.post(
+            response = _session.post(
                 url_file_classification, json={
                     "folder_path": str(existing_repo_path), 
                     "batch_size": 50,
-                    "max_workers": 10,
+                    "max_workers": 20,
                     "GEMINI_API_KEY": gemini_api_key,
                     "ANTHROPIC_API_KEY": "",
                     "OPENAI_API_KEY": openai_api_key
-                } # Use the path in the shared volume
+                }#, timeout=120 # Use the path in the shared volume
             )
             
             if response.status_code != 200:

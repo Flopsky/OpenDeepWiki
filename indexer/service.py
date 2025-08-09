@@ -253,8 +253,10 @@ class ClassifierNode(ClassifierConfig):
         files_paths = files_structure["all_files_with_path"]
 
         # Split files into batches
+        # Bound batch_size to avoid too many tiny batches (scheduler overhead)
+        effective_batch_size = max(5, min(batch_size, 50))
         batches = [
-            file_names[i : i + batch_size] for i in range(0, len(file_names), batch_size)
+            file_names[i : i + effective_batch_size] for i in range(0, len(file_names), effective_batch_size)
         ]
 
         all_results = {"file_classifications": []}
@@ -273,8 +275,8 @@ class ClassifierNode(ClassifierConfig):
             )
             tasks.append(task)
 
-        # Use asyncio.gather with semaphore to limit concurrency
-        semaphore = asyncio.Semaphore(max_workers)
+        # Use asyncio.gather with semaphore to limit concurrency to a safe cap
+        semaphore = asyncio.Semaphore(min(max_workers, 50))
         
         async def bounded_task(task):
             async with semaphore:
@@ -322,7 +324,7 @@ class InformationCompressorNode(ClassifierConfig):
             # Use async file reading for non-blocking I/O
             async with aiofiles.open(file_batch, "r") as f:
                 file_content = await f.read()
-                batch_prompt = user_prompt + "\n" + file_content
+            batch_prompt = user_prompt + "\n" + file_content
         except Exception as e:
             return None, None
 

@@ -2,9 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { FiUser, FiCpu, FiCopy, FiCheck, FiInfo } from 'react-icons/fi';
+import { FiUser, FiCpu, FiCopy, FiCheck, FiInfo, FiArrowDown, FiLoader } from 'react-icons/fi';
 
-const ChatMessages = ({ messages }) => {
+const ChatMessages = ({ messages, isLoading = false }) => {
   const [hoveredMessage, setHoveredMessage] = useState(null);
   const [copiedMessage, setCopiedMessage] = useState(null);
   const messagesEndRef = useRef(null);
@@ -20,6 +20,13 @@ const ChatMessages = ({ messages }) => {
     }
     prevMessagesLengthRef.current = messages.length;
   }, [messages, userScrolled]);
+
+  // Ensure we keep the view pinned to bottom while loading
+  useEffect(() => {
+    if (isLoading && !userScrolled) {
+      scrollToBottom();
+    }
+  }, [isLoading, userScrolled]);
   
   // Function to scroll to bottom
   const scrollToBottom = () => {
@@ -86,7 +93,15 @@ const ChatMessages = ({ messages }) => {
   };
   
   return (
-    <div ref={containerRef} onScroll={handleScroll} className="messages-container">
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      className="messages-container"
+      role="log"
+      aria-live="polite"
+      aria-relevant="additions"
+      style={{ position: 'relative' }}
+    >
       {messages.map((message, index) => (
         <div 
           key={index}
@@ -373,7 +388,51 @@ const ChatMessages = ({ messages }) => {
           )}
         </div>
       ))}
+
+      {/* Typing indicator while loading */}
+      {isLoading && (
+        <div className="message-row assistant fade-in">
+          <div className="message-container">
+            <div className="message-avatar assistant">
+              <FiCpu size={16} />
+            </div>
+            <div className="message-content" aria-label="Assistant is typing">
+              <div style={{ display: 'inline-flex', alignItems: 'center', gap: '8px', opacity: 0.9 }}>
+                <FiLoader size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                <span>Thinking…</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <div ref={messagesEndRef} style={{ height: '1px', width: '100%' }} />
+
+      {/* Scroll to bottom button */}
+      {userScrolled && (
+        <button
+          onClick={scrollToBottom}
+          aria-label="Scroll to bottom"
+          title="Scroll to bottom"
+          style={{
+            position: 'absolute',
+            right: '24px',
+            bottom: '24px',
+            background: 'rgba(0, 0, 0, 0.4)',
+            backdropFilter: 'blur(6px)',
+            border: '1px solid rgba(255, 255, 255, 0.15)',
+            color: 'white',
+            width: '36px',
+            height: '36px',
+            borderRadius: '50%',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            boxShadow: '0 4px 12px rgba(0,0,0,0.3)'
+          }}
+        >
+          <FiArrowDown size={16} />
+        </button>
+      )}
     </div>
   );
 };

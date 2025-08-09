@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { FiPlus, FiMenu, FiX, FiGithub, FiUpload, FiUser, FiMessageSquare, FiTrash2, FiSettings } from 'react-icons/fi';
+import { FiPlus, FiSidebar, FiX, FiGithub, FiUpload, FiUser, FiMessageSquare, FiTrash2, FiSettings } from 'react-icons/fi';
 import api from './services/api';
 import ChatMessages from './components/chat/ChatMessages';
 import ChatInput from './components/chat/ChatInput';
@@ -522,36 +522,17 @@ const App = () => {
       
       {/* Main Content */}
       <div className="main-content" style={{marginLeft: sidebarVisible ? '260px' : '0', width: sidebarVisible ? 'calc(100% - 260px)' : '100%', transition: 'margin-left 0.3s ease, width 0.3s ease'}}>
-        <div className="header">
-          {!sidebarVisible && (
+        {!sidebarVisible && (
             <button className="header-button" onClick={toggleSidebar}>
-              <FiMenu />
+              <FiSidebar />
             </button>
           )}
-          <div className="header-title">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style={{ marginRight: '0.5rem', display: 'inline-block', verticalAlign: 'middle' }}>
-              <rect width="24" height="24" rx="4" fill="#10a37f" />
-              <path d="M8 12L11 15L16 9" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-            <span style={{verticalAlign: 'middle'}}>
-              {activeRepositories.length > 0 
-                ? `opendeepwiki - ${activeRepositories.length} repo${activeRepositories.length > 1 ? 's' : ''} (${activeRepositories.join(', ')})` 
-                : repoParams.repo_name 
-                  ? `opendeepwiki - ${repoParams.repo_name}` 
-                  : 'opendeepwiki'
-              }
-            </span>
-          </div>
-          <button className="header-button">
-            Share
-          </button>
-        </div>
         
         <div className="chat-container">
           {chatHistory.length > 0 ? (
-            <ChatMessages messages={chatHistory} />
+            <ChatMessages messages={chatHistory} isLoading={isLoading} />
           ) : (
-            <div className="empty-state">
+            <div className="empty-state empty-state--raised">
               <h1 className="empty-state-title">What can I help with?</h1>
               <p className="empty-state-subtitle">
                 {activeRepositories.length > 0 
@@ -561,20 +542,38 @@ const App = () => {
                     : 'Initialize a repository from the sidebar to get started. You can use a GitHub URL or upload a local repository.'
                 }
               </p>
+              {/* Inline input directly beneath empty state when conversation is empty */}
+              <div style={{ width: '100%', maxWidth: '900px', margin: '1rem auto 0' }}>
+                <ChatInput 
+                  onSendMessage={handleSendMessage} 
+                  disabled={(activeRepositories.length === 0 && !repoParams.repo_name) || isLoading}
+                  isLoading={isLoading}
+                  placeholder={
+                    activeRepositories.length > 0 || repoParams.repo_name 
+                      ? "Message opendeepwiki..." 
+                      : "Initialize a repository to start chatting..."
+                  }
+                  inline
+                  draftKey={`draft_${activeRepositories.length > 0 ? activeRepositories[0] : repoParams.repo_name || 'default'}_${activeConversationId || 'new'}`}
+                />
+              </div>
             </div>
           )}
         </div>
         
-        <ChatInput 
-          onSendMessage={handleSendMessage} 
-          disabled={(activeRepositories.length === 0 && !repoParams.repo_name) || isLoading}
-          isLoading={isLoading}
-          placeholder={
-            activeRepositories.length > 0 || repoParams.repo_name 
-              ? "Message opendeepwiki..." 
-              : "Initialize a repository to start chatting..."
-          }
-        />
+        {chatHistory.length > 0 && (
+          <ChatInput 
+            onSendMessage={handleSendMessage} 
+            disabled={(activeRepositories.length === 0 && !repoParams.repo_name) || isLoading}
+            isLoading={isLoading}
+            placeholder={
+              activeRepositories.length > 0 || repoParams.repo_name 
+                ? "Message opendeepwiki..." 
+                : "Initialize a repository to start chatting..."
+            }
+            draftKey={`draft_${activeRepositories.length > 0 ? activeRepositories[0] : repoParams.repo_name || 'default'}_${activeConversationId || 'new'}`}
+          />
+        )}
       </div>
       
       {/* Configuration Modal */}

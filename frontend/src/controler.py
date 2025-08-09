@@ -7,6 +7,7 @@ from werkzeug.utils import secure_filename
 import tempfile
 import shutil
 import requests
+import requests.adapters
 import json
 import logging
 import traceback
@@ -44,6 +45,12 @@ controller_logger = logging.getLogger(__name__)
 
 # Thread pool executor (moved from model_server.py)
 executor = ThreadPoolExecutor(max_workers=40)
+
+# Reuse HTTP connections to downstream services (significant latency reduction)
+_session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=200, max_retries=2)
+_session.mount("http://", _adapter)
+_session.mount("https://", _adapter)
 
 # URL for Custom Documentalist (moved from model_server.py)
 custom_doc_url = "http://localhost:8001/score"

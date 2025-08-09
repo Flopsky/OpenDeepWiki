@@ -7,6 +7,9 @@ typer
 pre-commit
 langfuse==2.53.1
 uvicorn
+uvloop
+httptools
+orjson
 streamlit
 gradio>=5.0.2
 anthropic

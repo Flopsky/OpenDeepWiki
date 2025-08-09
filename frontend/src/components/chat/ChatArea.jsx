@@ -130,7 +130,7 @@ const ChatArea = ({
         <Title theme={theme}>
           {hasRepoInfo ? (
             <>
-              <RepoIcon size={16} /> {repoParams.repo_name}
+              <RepoIcon size={16} /> opendeepwiki - {repoParams.repo_name}
             </>
           ) : 'opendeepwiki'}
         </Title>
@@ -142,7 +142,7 @@ const ChatArea = ({
       
       {hasMessages ? (
         <MessagesContainer>
-          <ChatMessages messages={chatHistory} />
+          <ChatMessages messages={chatHistory} isLoading={isLoading} />
         </MessagesContainer>
       ) : (
         <EmptyState theme={theme}>
