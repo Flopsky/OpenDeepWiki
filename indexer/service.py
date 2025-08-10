@@ -3,6 +3,7 @@ import sys
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.append(project_root)
+import time
 
 from src.schemas.description import (
     TemplateManager,
@@ -352,11 +353,16 @@ class InformationCompressorNode(ClassifierConfig):
             )
 
         # --- Retry Logic ---
-        max_attempts = 4 # 1 initial + 3 retries
+        # Respect a strict overall timeout budget across all fallbacks, configurable via env
+        total_timeout_seconds = float(os.getenv("LLM_TOTAL_TIMEOUT_SECONDS", "8.0"))
+        default_attempt_timeout = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SECONDS", "8.0"))
+        max_attempts = int(os.getenv("LLM_MAX_ATTEMPTS", "4"))  # 1 initial + 3 retries by default
+
         clients_to_try = [(client_gemini, model_name)] + list(zip(fallback_clients or [], fallback_model_names or []))
         # Ensure we don't try more clients than available or exceed max_attempts
         clients_to_try = clients_to_try[:max_attempts]
 
+        deadline = time.monotonic() + total_timeout_seconds
         last_exception = None
         last_status_message = ""
 
@@ -395,7 +401,18 @@ class InformationCompressorNode(ClassifierConfig):
                             )
                         )
 
-                completion, raw = await asyncio.wait_for(api_call_task(), timeout=8.0)
+                # Compute remaining time budget for this attempt
+                remaining_budget = max(0.0, deadline - time.monotonic())
+                if remaining_budget <= 0:
+                    last_status_message = (
+                        f"Exceeded total timeout budget of {total_timeout_seconds:.1f}s "
+                        f"before attempt {attempt + 1} (Model: {current_model_name})"
+                    )
+                    last_exception = asyncio.TimeoutError(last_status_message)
+                    break
+
+                per_attempt_timeout = max(0.2, min(default_attempt_timeout, remaining_budget))
+                completion, raw = await asyncio.wait_for(api_call_task(), timeout=per_attempt_timeout)
 
                 # --- Success ---
                 result = completion.model_dump()
@@ -414,7 +431,11 @@ class InformationCompressorNode(ClassifierConfig):
                 return result, index
 
             except asyncio.TimeoutError:
-                last_status_message = f"Attempt {attempt + 1} timed out after 5s (Model: {current_model_name})"
+                # Update message to reflect the dynamic per-attempt timeout
+                last_status_message = (
+                    f"Attempt {attempt + 1} timed out within {min(default_attempt_timeout, max(0.0, deadline - time.monotonic())):.1f}s "
+                    f"(Model: {current_model_name})"
+                )
                 last_exception = asyncio.TimeoutError(last_status_message) # Store exception type
 
             except Exception as e:
@@ -426,8 +447,13 @@ class InformationCompressorNode(ClassifierConfig):
                 generation.status_message=last_status_message # Keep updating status message on failures
                 generation.model = current_model_name # Ensure model name reflects the failed attempt
 
-        # --- All attempts failed ---
+        # --- All attempts failed or deadline exceeded ---
         if generation:
+            # If the deadline is exceeded, make it clear in the final status
+            if time.monotonic() > deadline and "Exceeded total timeout" not in last_status_message:
+                last_status_message = (
+                    f"Exceeded total timeout budget of {total_timeout_seconds:.1f}s after {attempt + 1} attempts"
+                )
             generation.end(
                 output=None,
                 status_message=last_status_message,
@@ -630,9 +656,13 @@ class ClassifierService:
 
 # test
 if __name__ == "__main__":
+    start_time = time.time()
+    print(f"Start time: {start_time}")
     async def main():
         classifier_service = ClassifierService()
-        result = await classifier_service.run_pipeline("/Users/davidperso/projects/deepgithub/backend/app",GEMINI_API_KEY=os.getenv("GEMINI_API_KEY"))
+        result = await classifier_service.run_pipeline("/Users/davidperso/projects/repository_folder/arxflix",GEMINI_API_KEY=os.getenv("GEMINI_API_KEY"))
         print(result)
-    
+
     asyncio.run(main())
+    end_time = time.time()
+    print(f"Time taken: {end_time - start_time} seconds")
