@@ -74,6 +74,7 @@ run: env-check ## Run the Docker container in detached mode
 		docker rm $(CONTAINER_NAME); \
 		echo "Starting Docker container $(CONTAINER_NAME)..."; \
 		docker run -d --name $(CONTAINER_NAME) \
+		  --ulimit nofile=65535:65535 --ulimit nproc=8192:8192\
 		  -p 7860:7860 \
 		  -p 5050:5050 \
 		  -p 8001:8001 \
@@ -83,6 +84,7 @@ run: env-check ## Run the Docker container in detached mode
 	else \
 		echo "Starting Docker container $(CONTAINER_NAME)..."; \
 		docker run -d --name $(CONTAINER_NAME) \
+		  --ulimit nofile=65535:65535 --ulimit nproc=8192:8192\
 		  -p 7860:7860 \
 		  -p 5050:5050 \
 		  -p 8001:8001 \

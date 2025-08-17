@@ -80,30 +80,22 @@ def generate_code_structure_model_consize(code_text: str):
             example="Handles data storage and retrieval",
         )
         attributes: List[AttributeInfo] = Field(
-            description="Attribus of the class",
-            example={
-                """
-                [
+            description="Attributes of the class",
+            example=[
                 {
                     "attribute_name": "data",
-                    "attribute_description": "Data storage for the class"
+                    "attribute_description": "Data storage for the class",
                 }
-                ]
-                """
-            },
+            ],
         )
         functions_in_class: List[FunctionInfo] = Field(
-            description="Fonctions of the class",
-            example={
-                """
-                [
+            description="Functions of the class",
+            example=[
                 {
                     "function_name": "calculate_average",
-                    "function_description": "Calculate the average of a list of numbers"
+                    "function_description": "Calculate the average of a list of numbers",
                 }
-                ]
-                """
-            },
+            ],
         )
 
     def generate_code_structure_model(code_text: str) -> BaseModel:
@@ -117,47 +109,39 @@ def generate_code_structure_model_consize(code_text: str):
             """
 
             global_code_description: str = Field(
-                description="Description of the entire code",
-                example="This code contains functions for mathematical operations",
+                description="High-level summary of what the codebase or file does",
+                example="Utility functions for mathematical operations and data management.",
             )
             functions_out_class: Optional[List[FunctionInfo]] = Field(
                 None,
                 description="List of functions not belonging to any class",
                 example=[
-                    """
-                [
                     {
-                    "function_name": "calculate_sum",
-                    "function_description": "Calculate the sum of a list of numbers"
+                        "function_name": "calculate_sum",
+                        "function_description": "Calculate the sum of a list of numbers",
                     }
-                ]
-                """
                 ],
             )
             classes: Optional[List[ClassInfo]] = Field(
                 None,
                 description="List of classes in the code",
                 example=[
-                    """
-                    [
-                        {
-                            "class_name": "DataStore",
-                            "class_description": "Handles data storage and retrieval",
-                            "attributes": [
-                                {
-                                    "attribute_name": "data",
-                                    "attribute_description": "Data storage for the class"
-                                }
-                            ],
-                            "functions_in_class": [
-                                {
-                                    "function_name": "calculate_average",
-                                    "function_description": "Calculate the average of a list of numbers"
-                                }
-                            ]
-                        }
-                    ]
-                    """
+                    {
+                        "class_name": "DataStore",
+                        "class_description": "Handles data storage and retrieval",
+                        "attributes": [
+                            {
+                                "attribute_name": "data",
+                                "attribute_description": "Data storage for the class",
+                            }
+                        ],
+                        "functions_in_class": [
+                            {
+                                "function_name": "calculate_average",
+                                "function_description": "Calculate the average of a list of numbers",
+                            }
+                        ],
+                    }
                 ],
             )
 
@@ -165,15 +149,15 @@ def generate_code_structure_model_consize(code_text: str):
             def check_names_are_in_file(cls, values):
                 """
                 Ensure that all names mentioned in the model are present in the provided code text.
-                Accumulate all errors and raise them once if the accumlation string is not empty
+                Accumulate all errors and raise them once if the accumulation string is not empty
                 """
                 errors = []
-                for function in values.functions_out_class:
+                for function in (values.functions_out_class or []):
                     if function.function_name not in code_text:
                         errors.append(
                             f"Function {function.function_name} not found in code"
                         )
-                for class_info in values.classes:
+                for class_info in (values.classes or []):
                     if class_info.class_name not in code_text:
                         errors.append(
                             f"Class {class_info.class_name} not found in code"

@@ -19,7 +19,7 @@ dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
 
 LANG_DISABLE_TRACING = os.getenv("LANG_DISABLE_TRACING", "true").lower() == "true"
-LANGFUSE_BATCH_SIZE = int(os.getenv("LANGFUSE_BATCH_SIZE", "10"))
+LANGFUSE_BATCH_SIZE = int(os.getenv("LANGFUSE_BATCH_SIZE", "50"))
 LANGFUSE_FLUSH_INTERVAL = int(os.getenv("LANGFUSE_FLUSH_INTERVAL", "5"))
 
 # Context variables for managing tracing context

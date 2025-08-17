@@ -17,6 +17,9 @@ import instructor
 from google.generativeai import caching
 import google.generativeai as genai
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from repo_chat.utils_retrieval import order_docs_stably, chunk_ranges
+from repo_chat.selection import llm_select_files
 import logging
 import traceback
 from openai import OpenAI
@@ -182,13 +185,12 @@ class Documentation_Context_Retriver_Node(ClassifierConfig):
             if config_doc and config_doc[0] != {}:
                 documentation = documentation + config_doc
 
-        for index, doc in enumerate(documentation):
-            doc["file_id"] = index
-
-        user_prompt = user_prompt.replace("FILES_HERE", str(documentation))
-
         if len(documentation) == 0:
             return {"files_list": []}
+
+        # Assign stable global file_ids for combined md+config set
+        for index, doc in enumerate(documentation):
+            doc["file_id"] = index
         # Configure safety settings
         safe = [
             {"category": "HARM_CATEGORY_DANGEROUS", "threshold": "BLOCK_NONE"},
@@ -205,31 +207,64 @@ class Documentation_Context_Retriver_Node(ClassifierConfig):
             # Use default API key from environment
             genai.configure()
             
-        client_gemini = instructor.from_gemini(
-            client=genai.GenerativeModel(
-                model_name=self.documentation_context_retriver_model, safety_settings=safe
-            ),
-            mode=instructor.Mode.GEMINI_JSON,
-        )
+        # Prepare chunking parameters
+        chunk_size = int(os.getenv("CHUNK_SIZE", "400"))
+        overlap = int(os.getenv("CHUNK_OVERLAP", "50"))
+        max_parallel = int(os.getenv("CHUNK_PARALLEL_LIMIT", "4"))
+        max_selection_files = int(os.getenv("MAX_SELECTION_FILES", "50"))
 
-        # Process batches in parallel
-        messages = [
-            {"role": "system", "content": symstem_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-
-        # Simulate a delay with random jitter
-
-
-        if span:
-            generation = span.generation(
-                name="gemini",
-                model=self.documentation_context_retriver_model,
-                model_parameters={"temperature": 0, "top_p": 1, "max_new_tokens": 8000},
-                input={"system_prompt": symstem_prompt, "user_prompt": user_prompt},
+        # Helper to perform one LLM retrieval call for a chunk
+        def _retrieve_one(chunk_docs: list[dict]):
+            local_user_prompt = user_prompt.replace("FILES_HERE", str(chunk_docs))
+            client_gemini_local = instructor.from_gemini(
+                client=genai.GenerativeModel(
+                    model_name=self.documentation_context_retriver_model, safety_settings=safe
+                ),
+                mode=instructor.Mode.GEMINI_JSON,
             )
+            local_messages = [
+                {"role": "system", "content": symstem_prompt},
+                {"role": "user", "content": local_user_prompt},
+            ]
+            completion, raw = client_gemini_local.chat.create_with_completion(
+                messages=local_messages,
+                response_model=get_necesary_files({"documentation": chunk_docs}),
+                generation_config={
+                    "temperature": 0.0,
+                    "top_p": 1,
+                    "candidate_count": 1,
+                    "max_output_tokens": 8000,
+                },
+                max_retries=10,
+            )
+            return completion.model_dump()
 
-        try:
+        # use shared chunk_ranges utility for consistency
+
+        # Decide single vs chunked path
+        total_items = len(documentation)
+        candidates: list[dict] = []
+
+        if total_items <= chunk_size:
+            # Single call as before
+            local_user_prompt = user_prompt.replace("FILES_HERE", str(documentation))
+            client_gemini = instructor.from_gemini(
+                client=genai.GenerativeModel(
+                    model_name=self.documentation_context_retriver_model, safety_settings=safe
+                ),
+                mode=instructor.Mode.GEMINI_JSON,
+            )
+            messages = [
+                {"role": "system", "content": symstem_prompt},
+                {"role": "user", "content": local_user_prompt},
+            ]
+            if span:
+                generation = span.generation(
+                    name="gemini",
+                    model=self.documentation_context_retriver_model,
+                    model_parameters={"temperature": 0, "top_p": 1, "max_new_tokens": 8000},
+                    input={"system_prompt": symstem_prompt, "user_prompt": local_user_prompt},
+                )
             completion, raw = client_gemini.chat.create_with_completion(
                 messages=messages,
                 response_model=get_necesary_files({"documentation": documentation}),
@@ -242,25 +277,65 @@ class Documentation_Context_Retriver_Node(ClassifierConfig):
                 max_retries=10,
             )
             result = completion.model_dump()
-
-        except Exception as e:
             if span:
                 generation.end(
-                    output=None,
-                    status_message=f"Error processing batch: {str(e)}",
-                    level="ERROR",
+                    output=result,
+                    usage={
+                        "input": raw.usage_metadata.prompt_token_count,
+                        "output": raw.usage_metadata.candidates_token_count,
+                    },
                 )
+            candidates = result.get("files_list", [])
+        else:
+            # Chunked parallel retrieval
+            ranges = chunk_ranges(total_items, chunk_size, overlap)
+            chunk_results: list[dict] = []
+            with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+                futures = []
+                for (s, e) in ranges:
+                    chunk_docs = documentation[s:e]
+                    futures.append(executor.submit(_retrieve_one, chunk_docs))
+                for fut in futures:
+                    try:
+                        chunk_results.append(fut.result())
+                    except Exception:
+                        continue
+            # Merge all candidates
+            seen = set()
+            for r in chunk_results:
+                for item in (r or {}).get("files_list", []) or []:
+                    fid = str(item.get("file_id"))
+                    if fid in seen:
+                        continue
+                    seen.add(fid)
+                    candidates.append(item)
 
-        if span:
-            generation.end(
-                output=result,
-                usage={
-                    "input": raw.usage_metadata.prompt_token_count,
-                    "output": raw.usage_metadata.candidates_token_count,
-                },
+        # Final LLM-based selection over merged candidates (top-N)
+        # Construct documentation list with int file_ids for validation
+        doc_candidates = []
+        for it in candidates:
+            try:
+                doc_candidates.append({"file_name": it.get("file_name"), "file_id": int(it.get("file_id"))})
+            except Exception:
+                continue
+
+        if not doc_candidates:
+            return {"files_list": []}
+
+        try:
+            selected_list = llm_select_files(
+                candidates=doc_candidates,
+                system_prompt=symstem_prompt,
+                user_prompt_template=user_prompt,
+                safety_settings=safe,
+                default_model_name=self.documentation_context_retriver_model,
+                max_files=max_selection_files,
             )
-
-        return result
+            return {"files_list": selected_list}
+        except Exception:
+            # Fallback: truncate candidates deterministically
+            ordered = sorted(candidates, key=lambda x: int(x.get("file_id", 0)))
+            return {"files_list": ordered[:max_selection_files]}
 
 
 class Context_Caching_Retriver_Node(ClassifierConfig):
@@ -380,6 +455,166 @@ class Context_Caching_Retriver_Node(ClassifierConfig):
 
         return list_of_files
 
+
+    # moved to repo_chat/utils_retrieval.order_docs_stably
+
+    def intelligent_file_selection(
+        self,
+        retrieved_files: list[dict],
+        symstem_prompt: str,
+        selection_user_prompt: str,
+        max_files: int = int(os.getenv("MAX_SELECTION_FILES", "50")),
+    ) -> list[dict]:
+        """
+        LLM-based selection among retrieved_files. Uses get_necesary_files schema
+        and FILE_SELECTION_MODEL if provided; falls back to context_caching_retriver model.
+        """
+        # Deduplicate candidates and normalize
+        candidates_map = {}
+        for item in retrieved_files or []:
+            try:
+                fid = str(item.get("file_id"))
+                fname = str(item.get("file_name"))
+                if fid and fname and fid not in candidates_map:
+                    candidates_map[fid] = {"file_name": fname, "file_id": int(fid)}
+            except Exception:
+                continue
+
+        candidate_docs = list(candidates_map.values())
+        if not candidate_docs:
+            return []
+
+        # Build prompt with candidates injected
+        user_prompt_filled = selection_user_prompt.replace("FILES_HERE", str(candidate_docs))
+
+        try:
+            selected = llm_select_files(
+                candidates=candidate_docs,
+                system_prompt=symstem_prompt,
+                user_prompt_template=user_prompt_filled,
+                safety_settings=SAFE,
+                default_model_name=self.context_caching_retriver_model,
+                max_files=max_files,
+            )
+            if selected:
+                return selected
+        except Exception:
+            pass
+
+        # Fallback deterministic selection
+        ordered = sorted(candidate_docs, key=lambda x: int(x.get("file_id", 0)))[:max_files]
+        return [{"file_name": it.get("file_name"), "file_id": str(it.get("file_id"))} for it in ordered]
+
+    @trace
+    def retrieve_from_chunked_repository(
+        self,
+        repository_name: str,
+        documentation: dict,
+        symstem_prompt: str,
+        user_prompt: str,
+        max_parallel: int = int(os.getenv("CHUNK_PARALLEL_LIMIT", "4")),
+        GEMINI_API_KEY: str = "",
+        ANTHROPIC_API_KEY: str = "",
+        OPENAI_API_KEY: str = "",
+        trace_id: str = "df8187ba-a07e-4ea9-9117-5a7662eaa063",
+    ) -> dict:
+        span = get_langfuse_context().get("span")
+        # Safety settings
+        safe = [
+            {"category": "HARM_CATEGORY_DANGEROUS", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+
+        # Configure Gemini with API key if provided
+        if GEMINI_API_KEY:
+            genai.configure(api_key=GEMINI_API_KEY)
+        else:
+            genai.configure()
+
+        # Locate cache index (support both local and container paths)
+        index_path_candidates = [
+            Path("cache_index") / f"{repository_name}.json",
+            Path("/app/cache_index") / f"{repository_name}.json",
+        ]
+        index_path = next((p for p in index_path_candidates if p.exists()), None)
+        if index_path is None:
+            raise FileNotFoundError(f"Cache index not found for repository {repository_name}")
+
+        try:
+            with open(index_path, "r") as f:
+                repo_cache_info = json.load(f)
+        except Exception as e:
+            raise Exception(f"Failed to read cache index for {repository_name}: {e}")
+
+        chunks = repo_cache_info.get("chunks", [])
+        if not chunks:
+            return {"files_list": []}
+
+        # Rebuild the same stable order used during chunk creation
+        ordered_docs = order_docs_stably(documentation)
+
+        # Prepare parallel retrieval across chunk caches
+        results_raw: list[dict] = []
+        retrieval_errors = 0
+
+        def _retrieve_one(chunk: dict) -> dict | None:
+            cache_id = chunk.get("cache_id")
+            fr = chunk.get("file_range", [0, -1])
+            start, end = int(fr[0]), int(fr[1])
+            # Slicing: end is inclusive in index, add +1
+            chunk_docs = ordered_docs[start : end + 1]
+            local_doc = {"documentation": chunk_docs}
+            try:
+                cache = caching.CachedContent.get(cache_id)
+                client_gemini = instructor.from_gemini(
+                    client=genai.GenerativeModel.from_cached_content(
+                        cached_content=cache, safety_settings=safe
+                    ),
+                    mode=instructor.Mode.GEMINI_JSON,
+                )
+                return self.process_batch(
+                    client_gemini,
+                    symstem_prompt,
+                    user_prompt,
+                    span,
+                    local_doc,
+                    cache_id,
+                )
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = {executor.submit(_retrieve_one, c): c for c in chunks}
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res is None:
+                    retrieval_errors += 1
+                    continue
+                results_raw.append(res)
+
+        # Merge and deduplicate by file_id
+        merged: list[dict] = []
+        seen_ids: set[str] = set()
+        flat_candidates: list[dict] = []
+        for r in results_raw:
+            for item in r.get("files_list", []) or []:
+                flat_candidates.append(item)
+                fid = str(item.get("file_id"))
+                if fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
+                merged.append({"file_name": item.get("file_name"), "file_id": fid})
+
+        # Intelligent selection (rank + top-N)
+        selected = self.intelligent_file_selection(
+            retrieved_files=flat_candidates if flat_candidates else merged,
+            symstem_prompt=symstem_prompt,
+            selection_user_prompt=user_prompt,
+        )
+        return {"files_list": selected}
 
 
 class Final_Response_Generator_Node(ClassifierConfig):
@@ -686,14 +921,27 @@ class Librairie_Service(ClassifierConfig):
             context={"user_problem": querry_rewriter_output}
         )
         # 6. call documentation from context_caching_retriver node
-        documentation_from_context_caching_retriver_output = self.context_caching_retriver.context_caching_retrival(
-            cache_id=cache_id,
-            documentation=documentation,
-            symstem_prompt=prompt_system_librari_retriver_output,
-            user_prompt=user_prompt_librari_retriver_output,
-            GEMINI_API_KEY=GEMINI_API_KEY,
-            trace_id=trace_id
-        )
+        # Prefer chunked retrieval when cache_index exists; fallback to single cache
+        try:
+            files_from_chunks = self.context_caching_retriver.retrieve_from_chunked_repository(
+                repository_name=repository_name,
+                documentation=documentation,
+                symstem_prompt=prompt_system_librari_retriver_output,
+                user_prompt=user_prompt_librari_retriver_output,
+                GEMINI_API_KEY=GEMINI_API_KEY,
+                trace_id=trace_id
+            )
+            documentation_from_context_caching_retriver_output = files_from_chunks
+        except Exception as e:
+            logger.info(f"Chunked retrieval unavailable, falling back to single cache for {repository_name}: {e}")
+            documentation_from_context_caching_retriver_output = self.context_caching_retriver.context_caching_retrival(
+                cache_id=cache_id,
+                documentation=documentation,
+                symstem_prompt=prompt_system_librari_retriver_output,
+                user_prompt=user_prompt_librari_retriver_output,
+                GEMINI_API_KEY=GEMINI_API_KEY,
+                trace_id=trace_id
+            )
         
         # 7. user_prompt_config_retriver
         user_prompt_config_retriver_output = self.template_manager.render_template(

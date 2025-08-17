@@ -1,20 +1,25 @@
 from pydantic import BaseModel, Field, model_validator
-from typing import List
+from typing import List, Literal
 
 
-class FileClassifaction(BaseModel):
+class FileClassification(BaseModel):
     """
-    Used to classify a file
+    Single file classification entry.
+
+    One output row must be produced for each input item. Use the exact input
+    `file_id` and `file_name` without modification.
     """
 
-    file_id: int = Field(description="the original id of the file", example=[3, 30])
-    file_name: str = Field(description="Name of the file", example="example.pdf")
-    classification: str = Field(
-        description="""Classification of the file which can be one of the following :
-            - code_file
-            - doc_file
-            - configuration_file
-            - other""",
+    file_id: int = Field(
+        description="Original identifier for the file from the input list",
+        example=7,
+    )
+    file_name: str = Field(
+        description="Exact file name as provided in the input",
+        example="README.md",
+    )
+    classification: Literal["code_file", "doc_file", "configuration_file", "other"] = Field(
+        description="Classification label",
         example="doc_file",
     )
 
@@ -23,23 +28,26 @@ def create_file_classification(
     file_name_for_verification: List[str], scores
 ) -> BaseModel:
     """
-    input :
-    file_name_for_verification  is used to check that all file are classified
+    Create a Pydantic model to validate the file classification response.
 
-    ouput :
-        A type FileClassifications which all constrain used to classify files
+    - file_name_for_verification: the original input list used to ensure each item
+      is classified exactly once. Each element is a dict with keys `file_id` and
+      `file_name`.
+    - scores: a single-item list used to track validation passes upstream.
+
+    Returns a `FileClassifications` model enforcing completeness and no hallucination.
     """
 
     class FileClassifications(BaseModel):
         """
-        Model Used to classify files
+        List of file classifications corresponding 1:1 with the input files.
         """
 
-        file_classifications: List[FileClassifaction] = Field(
+        file_classifications: List[FileClassification] = Field(
             description="List of file classifications",
             example=[
-                {"file_name": "example.pdf", "classification": "doc_file"},
-                {"file_name": "example.txt", "classification": "code_file"},
+                {"file_id": 1, "file_name": "README.md", "classification": "doc_file"},
+                {"file_id": 2, "file_name": "main.py", "classification": "code_file"},
             ],
         )
 
@@ -47,7 +55,7 @@ def create_file_classification(
         def check_file_classification(cls, values):
             scores[0] += 1
 
-            # Create sets of dictionaries for comparison
+            # Create sets for comparison
             classified_files = {
                 (file_classification.file_name, file_classification.file_id)
                 for file_classification in values.file_classifications

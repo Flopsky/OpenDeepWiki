@@ -18,6 +18,7 @@ import zipfile
 import traceback
 import json
 from typing import List, Tuple, Dict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import dotenv
 import os
@@ -125,7 +126,7 @@ def clone_github_repo(folder_path: str, repo_url: str) -> Optional[str]:
         return None
 
 
-def create_cache(display_name: str, documentation: str, system_prompt: str, gemini_api_key=None):
+def create_cache(display_name: str, documentation: str, system_prompt: str, gemini_api_key=None, ttl_minutes: int = 5):
     # Configure Gemini API with the provided key or use the default
     configure_gemini_api(gemini_api_key)
     
@@ -190,7 +191,7 @@ def create_cache(display_name: str, documentation: str, system_prompt: str, gemi
             display_name=unique_display_name,  # used to identify the cache
             contents=documentation,
             system_instruction=system_prompt,
-            ttl=datetime.timedelta(minutes=5),
+            ttl=datetime.timedelta(minutes=ttl_minutes),
         )
         logger.info(f"Created new cache with display_name: {unique_display_name}, cache_id: {cache.name}")
         return cache.name
@@ -199,6 +200,105 @@ def create_cache(display_name: str, documentation: str, system_prompt: str, gemi
         raise
 
 
+def create_chunked_caches(
+    repo_name: str,
+    documentation_json: dict,
+    chunk_size: int = int(os.getenv("CHUNK_SIZE", "400")),
+    overlap: int = int(os.getenv("CHUNK_OVERLAP", "50")),
+    cache_ttl_min: int = int(os.getenv("CHUNK_CACHE_TTL_MIN", "5")),
+) -> dict:
+    """
+    Split documentation into overlapping chunks and create one Gemini cache per chunk.
+    Returns a RepositoryCacheInfo dict and writes it to cache_index/{repo}.json.
+    """
+    try:
+        docs: List[dict] = documentation_json.get("documentation", []) or []
+        total_files = len(docs)
+        if total_files == 0:
+            raise ValueError(f"No documentation items provided for repository {repo_name}")
+
+        # Stable ordering by file path, then file name, then file_id
+        def _doc_key(d: dict):
+            return (
+                str(d.get("file_paths", "")),
+                str(d.get("file_name", "")),
+                int(d.get("file_id", 0)),
+            )
+
+        ordered_docs = sorted(docs, key=_doc_key)
+
+        # Prepare overlapping chunk boundaries
+        step = max(1, chunk_size - max(0, overlap))
+        chunk_ranges: List[tuple[int, int]] = []
+        start_index = 0
+        while start_index < total_files:
+            end_index = min(start_index + chunk_size, total_files)
+            chunk_ranges.append((start_index, end_index))
+            if end_index == total_files:
+                break
+            start_index += step
+
+        # Create caches in parallel, bounded by CHUNK_PARALLEL_LIMIT
+        max_parallel = int(os.getenv("CHUNK_PARALLEL_LIMIT", "4"))
+        system_prompt = (
+            """
+# Context
+You are an expert Software developer with a deep understanding of the software development lifecycle, including requirements gathering, design, implementation, testing, and deployment.
+Your task is to answer any question related to the documentation of the python repository repository_name that you have in your context.
+
+"""
+        ).replace("repository_name", repo_name)
+
+        created_chunks: List[dict] = []
+
+        def _create_one(start: int, end: int) -> dict:
+            chunk_docs = ordered_docs[start:end]
+            chunk_payload = {"documentation": chunk_docs}
+            # Use deterministic base display name; unique suffix added by create_cache
+            base_display_name = f"{repo_name}__chunk_{start}-{end - 1}"
+            cache_id = create_cache(
+                display_name=base_display_name,
+                documentation=str(chunk_payload),
+                system_prompt=system_prompt,
+                gemini_api_key=None,
+                ttl_minutes=cache_ttl_min,
+            )
+            return {"cache_id": cache_id, "file_range": [start, end - 1]}
+
+        with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            futures = {executor.submit(_create_one, s, e): (s, e) for (s, e) in chunk_ranges}
+            for fut in as_completed(futures):
+                try:
+                    created_chunks.append(fut.result())
+                except Exception as e:
+                    logger.error(f"Failed to create chunk cache for {repo_name}: {e}")
+
+        # Sort chunks by start index for stability
+        created_chunks.sort(key=lambda c: c["file_range"][0])
+        cache_ids = [c["cache_id"] for c in created_chunks]
+
+        repo_cache_info = {
+            "repo_name": str(repo_name),
+            "cache_ids": cache_ids,
+            "chunks": created_chunks,
+            "total_files": total_files,
+            "created_at": datetime.datetime.utcnow().isoformat() + "Z",
+        }
+
+        # Persist index
+        index_dir = Path("cache_index")
+        index_dir.mkdir(parents=True, exist_ok=True)
+        index_path = index_dir / f"{repo_name}.json"
+        with open(index_path, "w") as f:
+            json.dump(repo_cache_info, f, indent=2)
+
+        logger.info(
+            f"Created {len(cache_ids)} chunked caches for {repo_name} (total_files={total_files}); index at {index_path}"
+        )
+        return repo_cache_info
+    except Exception as e:
+        logger.error(f"Error in create_chunked_caches for {repo_name}: {e}")
+        raise
 def get_cache(cache_name: str, gemini_api_key=None):
     """
     Retrieves a cached content object by its name.
@@ -320,10 +420,30 @@ Your task is to answer any question related to the documentation of the python r
         with open(config_path, "w") as f3:
             json.dump(config_json, f3, indent=4)
 
-    documentation_str = str(documentation_json)
-    cache_name = create_cache(display_name, documentation_str, system_prompt, gemini_api_key)
-
-    return cache_name
+    # Decide between single-cache and chunked caches
+    try:
+        cache_name = None
+        CHUNK_ENABLE_MIN_FILES = int(os.getenv("CHUNK_ENABLE_MIN_FILES", "1000"))
+        total_docs = len(documentation_json.get("documentation", []))
+        if total_docs > CHUNK_ENABLE_MIN_FILES:
+            # Defer to chunked caches
+            from src.core.init_repo import create_chunked_caches
+            repo_cache_info = create_chunked_caches(
+                repo_name=display_name,
+                documentation_json=documentation_json,
+                chunk_size=int(os.getenv("CHUNK_SIZE", "400")),
+                overlap=int(os.getenv("CHUNK_OVERLAP", "50")),
+                cache_ttl_min=int(os.getenv("CHUNK_CACHE_TTL_MIN", "5")),
+            )
+            cache_ids = repo_cache_info.get("cache_ids", [])
+            cache_name = cache_ids[0] if cache_ids else ""
+        else:
+            documentation_str = str(documentation_json)
+            cache_name = create_cache(display_name, documentation_str, system_prompt, gemini_api_key)
+        return cache_name
+    except Exception as e:
+        logger.error(f"Error while creating cache(s) for {display_name}: {e}")
+        raise
 
 
 def process_local_folder(repo_path_str: str, gemini_api_key=None, openai_api_key=None):
@@ -426,11 +546,30 @@ Your task is to answer any question related to the documentation of the python r
             raise Exception(f"Failed to write documentation files: {e}")
 
 
-    documentation_str = str(documentation_json) # Use the structure containing 'documentation' key
-    cache_name = create_cache(display_name, documentation_str, system_prompt, gemini_api_key)
-    logger.info(f"Cache created/updated for {display_name}: {cache_name}")
-
-    return cache_name
+    # Decide between single-cache and chunked caches
+    try:
+        cache_name = None
+        CHUNK_ENABLE_MIN_FILES = int(os.getenv("CHUNK_ENABLE_MIN_FILES", "1000"))
+        total_docs = len(documentation_json.get("documentation", []))
+        if total_docs > CHUNK_ENABLE_MIN_FILES:
+            from src.core.init_repo import create_chunked_caches
+            repo_cache_info = create_chunked_caches(
+                repo_name=display_name,
+                documentation_json=documentation_json,
+                chunk_size=int(os.getenv("CHUNK_SIZE", "400")),
+                overlap=int(os.getenv("CHUNK_OVERLAP", "50")),
+                cache_ttl_min=int(os.getenv("CHUNK_CACHE_TTL_MIN", "5")),
+            )
+            cache_ids = repo_cache_info.get("cache_ids", [])
+            cache_name = cache_ids[0] if cache_ids else ""
+        else:
+            documentation_str = str(documentation_json)
+            cache_name = create_cache(display_name, documentation_str, system_prompt, gemini_api_key)
+        logger.info(f"Cache created/updated for {display_name}: {cache_name}")
+        return cache_name
+    except Exception as e:
+        logger.error(f"Error while creating cache(s) for {display_name}: {e}")
+        raise
 
 
 
@@ -560,11 +699,29 @@ Your task is to answer any question related to the documentation of the python r
 
 """.replace("repository_name", repo_name)
             
-            documentation_str = str(documentation_json)
-            from src.core.init_repo import create_cache
-            cache_name = create_cache(repo_name, documentation_str, system_prompt, gemini_api_key)
-            
-            return cache_name
+            # Create caches based on activation rule
+            try:
+                CHUNK_ENABLE_MIN_FILES = int(os.getenv("CHUNK_ENABLE_MIN_FILES", "1000"))
+                total_docs = len(documentation_json.get("documentation", []))
+                if total_docs > CHUNK_ENABLE_MIN_FILES:
+                    from src.core.init_repo import create_chunked_caches
+                    repo_cache_info = create_chunked_caches(
+                        repo_name=repo_name,
+                        documentation_json=documentation_json,
+                        chunk_size=int(os.getenv("CHUNK_SIZE", "400")),
+                        overlap=int(os.getenv("CHUNK_OVERLAP", "50")),
+                        cache_ttl_min=int(os.getenv("CHUNK_CACHE_TTL_MIN", "5")),
+                    )
+                    cache_ids = repo_cache_info.get("cache_ids", [])
+                    cache_name = cache_ids[0] if cache_ids else ""
+                else:
+                    documentation_str = str(documentation_json)
+                    from src.core.init_repo import create_cache
+                    cache_name = create_cache(repo_name, documentation_str, system_prompt, gemini_api_key)
+                return cache_name
+            except Exception as e:
+                logger.error(f"Error while creating cache(s) for {repo_name}: {e}")
+                raise
         
         # If we have changes, process only those files
         # Create temporary directory within repository_folder instead of system default temp location
@@ -704,11 +861,29 @@ Your task is to answer any question related to the documentation of the python r
 
 """.replace("repository_name", repo_name)
             
-            documentation_str = str(documentation_json)
-            from src.core.init_repo import create_cache
-            cache_name = create_cache(repo_name, documentation_str, system_prompt, gemini_api_key)
-            
-            return cache_name
+            # Create caches based on activation rule
+            try:
+                CHUNK_ENABLE_MIN_FILES = int(os.getenv("CHUNK_ENABLE_MIN_FILES", "1000"))
+                total_docs = len(documentation_json.get("documentation", []))
+                if total_docs > CHUNK_ENABLE_MIN_FILES:
+                    from src.core.init_repo import create_chunked_caches
+                    repo_cache_info = create_chunked_caches(
+                        repo_name=repo_name,
+                        documentation_json=documentation_json,
+                        chunk_size=int(os.getenv("CHUNK_SIZE", "400")),
+                        overlap=int(os.getenv("CHUNK_OVERLAP", "50")),
+                        cache_ttl_min=int(os.getenv("CHUNK_CACHE_TTL_MIN", "5")),
+                    )
+                    cache_ids = repo_cache_info.get("cache_ids", [])
+                    cache_name = cache_ids[0] if cache_ids else ""
+                else:
+                    documentation_str = str(documentation_json)
+                    from src.core.init_repo import create_cache
+                    cache_name = create_cache(repo_name, documentation_str, system_prompt, gemini_api_key)
+                return cache_name
+            except Exception as e:
+                logger.error(f"Error while creating cache(s) for {repo_name}: {e}")
+                raise
         finally:
             # Clean up the temporary directory
             if temp_dir.exists():

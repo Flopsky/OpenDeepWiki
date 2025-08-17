@@ -1,9 +1,22 @@
 import os
 import sys
+import time
+import asyncio
+import logging
+import traceback
+from pathlib import Path
 
+# --- project path bootstrap ---
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.append(project_root)
-import time
+
+# --- third-party / local imports ---
+import dotenv
+import aiofiles
+import instructor
+import google.generativeai as genai
+from openai import OpenAI
+from langfuse.decorators import observe, langfuse_context
 
 from src.schemas.description import (
     TemplateManager,
@@ -13,28 +26,21 @@ from src.schemas.description import (
 )
 from src.schemas.classif import create_file_classification
 from .utils import list_all_files, SAFE
-import instructor
-import os
-import dotenv
-import traceback
-import asyncio
-import google.generativeai as genai
-from openai import OpenAI
-import aiofiles
-import logging
-import traceback
-from src.monitor import trace, generate_trace_id, get_langfuse_context, should_trace
-from pathlib import Path
+
+from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
-
 dotenv.load_dotenv()
 
 
+# ============================================================
+# Base config shared by nodes: clients, prompts, limits
+# ============================================================
 class ClassifierConfig:
     def __init__(self):
         current_dir = Path(__file__).parent
-        # Initialize TemplateManager with the correct search directory
+
+        # Templates
         self.template_manager = TemplateManager(default_search_dir=current_dir)
         self.prompts_config = {
             "system_classification": self.template_manager.render_template("prompts/system_prompt_classification.jinja2"),
@@ -46,52 +52,64 @@ class ClassifierConfig:
             "system_documentation": self.template_manager.render_template("prompts/prompt_documentations/system_prompt_documentation.jinja2"),
             "user_documentation": self.template_manager.render_template("prompts/prompt_documentations/user_prompt_documentation.jinja2"),
         }
-        # Dynamically gather all GEMINI_MODEL_* env variables so that
-        # adding new models is as simple as declaring them in the environment.
-        # This also preserves the legacy attributes (file_class_model_0 … _N)
-        # for backward-compatibility with the rest of the codebase.
 
+        # Gather models from env
         self.file_class_models: list[str] = []
-        for i in range(20):  # support up to 20 models – adjust if ever needed
-            model_name = os.getenv(f"GEMINI_MODEL_{i}")
-            if model_name:
-                self.file_class_models.append(model_name)
-                setattr(self, f"file_class_model_{i}", model_name)
+        for i in range(20):
+            mn = os.getenv(f"GEMINI_MODEL_{i}")
+            if mn:
+                self.file_class_models.append(mn)
+                setattr(self, f"file_class_model_{i}", mn)
 
-        # Gather GPT models
         self.gpt_models: list[str] = []
         for i in range(20):
-            gpt_model = os.getenv(f"GPT_MODEL_{i}")
-            if gpt_model:
-                self.gpt_models.append(gpt_model)
-                setattr(self, f"gpt_model_{i}", gpt_model)
-                logger.info(f"Found GPT model: GPT_MODEL_{i} = {gpt_model}")
+            gm = os.getenv(f"GPT_MODEL_{i}")
+            if gm:
+                self.gpt_models.append(gm)
+                setattr(self, f"gpt_model_{i}", gm)
+                logger.info(f"Found GPT model: GPT_MODEL_{i} = {gm}")
 
         logger.info(f"Total GPT models found: {len(self.gpt_models)} - {self.gpt_models}")
 
         if not self.file_class_models and not self.gpt_models:
-            raise ValueError("No GEMINI_MODEL_* or GPT_MODEL_* environment variables defined – at least one model is required.")
-        
-        # Shared client pool for reuse across methods - initialized lazily
+            raise ValueError("No GEMINI_MODEL_* or GPT_MODEL_* env vars defined – at least one model is required.")
+
+        # Concurrency controls (env-tunable)
+        self._limits = {
+            "openai": asyncio.Semaphore(int(os.getenv("OPENAI_INFLIGHT", "200"))),
+            "gemini": asyncio.Semaphore(int(os.getenv("GEMINI_INFLIGHT", "200"))),
+        }
+        self._file_io_limit = asyncio.Semaphore(int(os.getenv("FILE_INFLIGHT", "200")))
+
+        # Shared clients cache
         self._clients_cache = None
         self._model_names_cache = None
-    
-    def _get_or_create_clients(self, GEMINI_API_KEY: str = "", OPENAI_API_KEY: str = ""):
-        """Get or create shared client pool for reuse across methods"""
-        logger.info(f"_get_or_create_clients called with GEMINI_API_KEY={'***' if GEMINI_API_KEY else 'empty'}, OPENAI_API_KEY={'***' if OPENAI_API_KEY else 'empty'}")
-        logger.info(f"Available models - Gemini: {self.file_class_models}, GPT: {self.gpt_models}")
-        cache_key = (bool(GEMINI_API_KEY), bool(OPENAI_API_KEY))
-        if self._clients_cache is not None and getattr(self, "_cache_key", None) == cache_key:
-            return self._clients_cache, self._model_names_cache
-            
-        # Configure safety settings
-        safe = SAFE
+        self._cache_key = None
 
+    # Provider name resolver
+    @staticmethod
+    def _provider_for(model_name: str) -> str:
+        m = (model_name or "").lower()
+        return "gemini" if ("gemini" in m or "gemma" in m) else "openai"
+
+    # Create / reuse client pool
+    def _get_or_create_clients(self, GEMINI_API_KEY: str = "", OPENAI_API_KEY: str = ""):
+        logger.info(
+            f"_get_or_create_clients called with GEMINI_API_KEY={'***' if GEMINI_API_KEY else 'empty'}, "
+            f"OPENAI_API_KEY={'***' if OPENAI_API_KEY else 'empty'}"
+        )
+        logger.info(f"Available models - Gemini: {self.file_class_models}, GPT: {self.gpt_models}")
+
+        cache_key = (bool(GEMINI_API_KEY), bool(OPENAI_API_KEY))
+        if self._clients_cache is not None and self._cache_key == cache_key:
+            return self._clients_cache, self._model_names_cache
+
+        safe = SAFE
         clients = {}
         model_names = {}
         idx = 0
 
-        # --- Gemini / Gemma models ---
+        # Gemini/Gemma clients
         if self.file_class_models:
             if GEMINI_API_KEY:
                 genai.configure(api_key=GEMINI_API_KEY)
@@ -110,13 +128,12 @@ class ClassifierConfig:
                 except Exception as e:
                     logger.error(f"Failed to create Gemini client for model {model_name}: {e}")
 
-        # --- GPT / OpenAI models ---
+        # OpenAI clients
         if OPENAI_API_KEY and self.gpt_models:
             logger.info(f"Creating OpenAI clients for models: {self.gpt_models}")
             try:
                 openai_client = OpenAI(api_key=OPENAI_API_KEY)
                 for gpt_model in self.gpt_models:
-                    # Create separate instructor client for each model to handle different model names
                     openai_instructor = instructor.from_openai(
                         client=openai_client,
                         mode=instructor.Mode.JSON,
@@ -134,21 +151,23 @@ class ClassifierConfig:
 
         if not clients:
             raise RuntimeError("Unable to instantiate any LLM client. Check model names and credentials.")
-            
+
         logger.info(f"Created {len(clients)} total clients: {list(model_names.values())}")
-        
-        # Cache for reuse
+
         self._clients_cache = clients
         self._model_names_cache = model_names
         self._cache_key = cache_key
-        
         return clients, model_names
 
 
+# ============================================================
+# Classifier: fan out tasks; provider-bounded calls
+# ============================================================
 class ClassifierNode(ClassifierConfig):
     def __init__(self):
         super().__init__()
 
+    @observe(as_type="generation")
     async def process_batch(
         self,
         file_batch: list[str],
@@ -157,112 +176,104 @@ class ClassifierNode(ClassifierConfig):
         symstem_prompt: str,
         user_prompt: str,
         scores: list[int],
-        span=None,
     ) -> dict:
-        """Process a batch of files using Gemini API"""
+        """Process ONE batch (can be a single file) via the appropriate provider."""
         batch_prompt = user_prompt + "\n" + f"{file_batch}"
-
         messages = [
             {"role": "system", "content": symstem_prompt},
             {"role": "user", "content": batch_prompt},
         ]
 
-        if span:
-            generation = span.generation(
-                name="gemini",
-                model=model_name,
-                model_parameters={"temperature": 0, "top_p": 1, "max_new_tokens": 8000},
-                input={"system_prompt": symstem_prompt, "user_prompt": batch_prompt},
-            )
+        provider = self._provider_for(model_name)
+        loop = asyncio.get_event_loop()
 
         try:
-            # Detect if this is a Gemini or OpenAI client and use appropriate API
-            if "gemini" in model_name.lower() or "gemma" in model_name.lower():
-                # Gemini API
-                completion, raw = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: client_gemini.chat.create_with_completion(
-                        messages=messages,
-                        response_model=create_file_classification(file_batch, scores),
-                        generation_config={
-                            "temperature": 0.0,
-                            "top_p": 1,
-                            "candidate_count": 1,
-                            "max_output_tokens": 8000,
-                        },
-                        max_retries=3,
+            async with self._limits[provider]:
+                if provider == "gemini":
+                    completion, raw = await loop.run_in_executor(
+                        None,
+                        lambda: client_gemini.chat.create_with_completion(
+                            messages=messages,
+                            response_model=create_file_classification(file_batch, scores),
+                            generation_config={
+                                "temperature": 0.0,
+                                "top_p": 1,
+                                "candidate_count": 1,
+                                "max_output_tokens": 8000,  # keep as requested
+                            },
+                            max_retries=3,
+                        ),
                     )
-                )
-            else:
-                # OpenAI API
-                completion, raw = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: client_gemini.chat.completions.create_with_completion(
-                        model=model_name,
-                        messages=messages,
-                        response_model=create_file_classification(file_batch, scores),
-                        temperature=0.0,
-                        top_p=1,
-                        max_tokens=8000,
-                        max_retries=3,
+                else:
+                    completion, raw = await loop.run_in_executor(
+                        None,
+                        lambda: client_gemini.chat.completions.create_with_completion(
+                            model=model_name,
+                            messages=messages,
+                            response_model=create_file_classification(file_batch, scores),
+                            temperature=0.0,
+                            top_p=1,
+                            max_tokens=8000,  # keep as requested
+                            max_retries=3,
+                        ),
                     )
-                )
             result = completion.model_dump()
-
         except Exception as e:
-            if span:
-                generation.end(
-                    output=None,
+            # record failure into langfuse observation if available
+            try:
+                langfuse_context.update_current_observation(
                     status_message=f"Error processing batch: {str(e)}",
                     level="ERROR",
                 )
+            except Exception:
+                pass
             raise Exception(f"Batch processing failed: {str(e)}, {traceback.format_exc()}")
 
-        if span:
-            generation.end(
-                output=result,
+        # attach usage if SDK provided it
+        try:
+            langfuse_context.update_current_observation(
+                model=model_name,
+                model_parameters={"temperature": 0, "top_p": 1, "max_new_tokens": 8000},
                 usage={
-                    "input": raw.usage_metadata.prompt_token_count,
-                    "output": raw.usage_metadata.candidates_token_count,
+                    "input": getattr(getattr(raw, "usage_metadata", {}), "prompt_token_count", None),
+                    "output": getattr(getattr(raw, "usage_metadata", {}), "candidates_token_count", None),
                 },
             )
+        except Exception:
+            pass
 
         return result
 
-    @trace
+    @observe()
     async def llmclassifier(
         self,
         folder_path: str,
-        batch_size: int = 10,  # Ultra-small batches for maximum parallelism
-        max_workers: int = 100,  # Maximum concurrency for ultra-fast processing
+        batch_size: int = 1,          # default fan-out: single file per batch
+        max_workers: int = 100,       # overall task cap (optional; provider caps still apply)
         GEMINI_API_KEY: str = "",
         ANTHROPIC_API_KEY: str = "",
         OPENAI_API_KEY: str = "",
-        trace_id: str = ""
-    ) -> str:
-        span = get_langfuse_context().get("span")
-
+    ) -> dict:
+        """
+        Classify files. Fan out one task per (batch_size) files.
+        Set CLASSIFY_BATCH_SIZE env to override default (1).
+        """
         scores = [0]
+        env_batch = int(os.getenv("CLASSIFY_BATCH_SIZE", str(batch_size)))
+        batch_size = max(1, env_batch)
 
-        # Use shared client pool for better performance
+        # Clients
         clients, model_names = self._get_or_create_clients(GEMINI_API_KEY, OPENAI_API_KEY)
 
-        # Get file names
+        # Files
         files_structure = list_all_files(folder_path, include_md=True)
-
         file_names = files_structure["all_files_no_path"]
         files_paths = files_structure["all_files_with_path"]
 
-        # Split files into batches
-        # Bound batch_size to avoid too many tiny batches (scheduler overhead)
-        effective_batch_size = max(5, min(batch_size, 50))
-        batches = [
-            file_names[i : i + effective_batch_size] for i in range(0, len(file_names), effective_batch_size)
-        ]
+        # Batching
+        batches = [file_names[i:i + batch_size] for i in range(0, len(file_names), batch_size)]
 
-        all_results = {"file_classifications": []}
-
-        # Process batches in parallel using asyncio
+        # Tasks (distribute over client set)
         tasks = []
         for index, batch in enumerate(batches):
             task = self.process_batch(
@@ -272,39 +283,38 @@ class ClassifierNode(ClassifierConfig):
                 self.prompts_config["system_classification"],
                 self.prompts_config["user_classification"],
                 scores,
-                span,
             )
             tasks.append(task)
 
-        # Use asyncio.gather with semaphore to limit concurrency to a safe cap
-        semaphore = asyncio.Semaphore(min(max_workers, 50))
-        
-        async def bounded_task(task):
+        # Optional global task cap to avoid memory spikes
+        # (Provider/file semaphores are the main throttles)
+        semaphore = asyncio.Semaphore(max_workers)
+
+        async def bounded(t):
             async with semaphore:
-                return await task
+                return await t
 
-        bounded_tasks = [bounded_task(task) for task in tasks]
-        
-        try:
-            results = await asyncio.gather(*bounded_tasks)
-            for result in results:
-                all_results["file_classifications"].extend(
-                    result.get("file_classifications", [])
-                )
-        except Exception as e:
-            raise Exception(f"Batch processing failed: {str(e)}, {traceback.format_exc()}")
+        results = await asyncio.gather(*(bounded(t) for t in tasks))
 
-        # replace file_name by fileç_path
+        all_results = {"file_classifications": []}
+        for r in results:
+            all_results["file_classifications"].extend(r.get("file_classifications", []))
+
+        # Map file_id -> path
         for classification in all_results["file_classifications"]:
             classification["file_paths"] = files_paths[classification["file_id"]]
 
         return all_results
 
 
+# ============================================================
+# Summarizer/Compressor: one task per file; bounded I/O + provider caps
+# ============================================================
 class InformationCompressorNode(ClassifierConfig):
     def __init__(self):
         super().__init__()
-    
+
+    @observe(as_type="generation")
     async def process_batch(
         self,
         file_batch: str,
@@ -313,20 +323,20 @@ class InformationCompressorNode(ClassifierConfig):
         system_prompt: str,
         user_prompt: str,
         scores: list[int],
-        span=None,
         index=None,
         log_name=None,
         fallback_clients: list[instructor.Instructor] = None,
         fallback_model_names: list[str] = None,
-    ) -> dict:
-        """Process a batch of files using Gemini API with timeout and retries."""
+    ) -> tuple[dict | None, str | None]:
+        """Process a SINGLE file with timeout + provider-bound concurrency and file I/O bounding."""
+        # --- File I/O (bounded) ---
         batch_prompt = ""
         try:
-            # Use async file reading for non-blocking I/O
-            async with aiofiles.open(file_batch, "r") as f:
-                file_content = await f.read()
+            async with self._file_io_limit:
+                async with aiofiles.open(file_batch, "r") as f:
+                    file_content = await f.read()
             batch_prompt = user_prompt + "\n" + file_content
-        except Exception as e:
+        except Exception:
             return None, None
 
         messages = [
@@ -338,159 +348,128 @@ class InformationCompressorNode(ClassifierConfig):
             pydantic_model = generate_code_structure_model_consize(batch_prompt)
         elif log_name == "documentation":
             pydantic_model = DocumentCompression
-        else: # config
+        else:
             pydantic_model = YamlBrief
 
-        # --- Langfuse Span Setup ---
-        generation = None
-        if span:
-            # Create the generation span *before* the retry loop
-            generation = span.generation(
-                name=f"{log_name}_attempt", # Initial name, might update later
-                model=model_name, # Initial model
-                model_parameters={"temperature": 0, "top_p": 1, "max_new_tokens": 8000},
-                input={"system_prompt": system_prompt, "user_prompt": batch_prompt},
-            )
-
-        # --- Retry Logic ---
-        # Respect a strict overall timeout budget across all fallbacks, configurable via env
-        total_timeout_seconds = float(os.getenv("LLM_TOTAL_TIMEOUT_SECONDS", "8.0"))
-        default_attempt_timeout = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SECONDS", "8.0"))
-        max_attempts = int(os.getenv("LLM_MAX_ATTEMPTS", "4"))  # 1 initial + 3 retries by default
+        # Retry/time budget across fallbacks
+        total_timeout_seconds = float(os.getenv("LLM_TOTAL_TIMEOUT_SECONDS", "30.0"))
+        default_attempt_timeout = float(os.getenv("LLM_ATTEMPT_TIMEOUT_SECONDS", "15.0"))
+        max_attempts = int(os.getenv("LLM_MAX_ATTEMPTS", "4"))
 
         clients_to_try = [(client_gemini, model_name)] + list(zip(fallback_clients or [], fallback_model_names or []))
-        # Ensure we don't try more clients than available or exceed max_attempts
         clients_to_try = clients_to_try[:max_attempts]
 
         deadline = time.monotonic() + total_timeout_seconds
-        last_exception = None
         last_status_message = ""
 
         for attempt, (current_client, current_model_name) in enumerate(clients_to_try):
-            try:
-                # Use asyncio.wait_for for timeout instead of ThreadPoolExecutor
-                async def api_call_task():
-                    if "gemini" in current_model_name.lower() or "gemma" in current_model_name.lower():
-                        # Gemini API
-                        return await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: current_client.chat.create_with_completion(
-                                messages=messages,
-                                response_model=pydantic_model,
-                                generation_config={
-                                    "temperature": 0.0,
-                                    "top_p": 1,
-                                    "candidate_count": 1,
-                                    "max_output_tokens": 8000,
-                                },
-                                max_retries=1,
-                            )
-                        )
-                    else:
-                        # OpenAI API
-                        return await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: current_client.chat.completions.create_with_completion(
-                                model=current_model_name,
-                                messages=messages,
-                                response_model=pydantic_model,
-                                temperature=0.0,
-                                top_p=1,
-                                max_tokens=8000,
-                                max_retries=1,
-                            )
-                        )
+            provider = self._provider_for(current_model_name)
+            loop = asyncio.get_event_loop()
 
-                # Compute remaining time budget for this attempt
-                remaining_budget = max(0.0, deadline - time.monotonic())
-                if remaining_budget <= 0:
+            try:
+                async def api_call_task():
+                    async with self._limits[provider]:
+                        if provider == "gemini":
+                            return await loop.run_in_executor(
+                                None,
+                                lambda: current_client.chat.create_with_completion(
+                                    messages=messages,
+                                    response_model=pydantic_model,
+                                    generation_config={
+                                        "temperature": 0.0,
+                                        "top_p": 1,
+                                        "candidate_count": 1,
+                                        "max_output_tokens": 8000,  # keep as requested
+                                    },
+                                    max_retries=1,
+                                ),
+                            )
+                        else:
+                            return await loop.run_in_executor(
+                                None,
+                                lambda: current_client.chat.completions.create_with_completion(
+                                    model=current_model_name,
+                                    messages=messages,
+                                    response_model=pydantic_model,
+                                    temperature=0.0,
+                                    top_p=1,
+                                    max_tokens=8000,  # keep as requested
+                                    max_retries=1,
+                                ),
+                            )
+
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0:
                     last_status_message = (
-                        f"Exceeded total timeout budget of {total_timeout_seconds:.1f}s "
-                        f"before attempt {attempt + 1} (Model: {current_model_name})"
+                        f"Exceeded total timeout budget of {total_timeout_seconds:.1f}s before attempt {attempt + 1} "
+                        f"(Model: {current_model_name})"
                     )
-                    last_exception = asyncio.TimeoutError(last_status_message)
                     break
 
-                per_attempt_timeout = max(0.2, min(default_attempt_timeout, remaining_budget))
+                per_attempt_timeout = max(0.2, min(default_attempt_timeout, remaining))
                 completion, raw = await asyncio.wait_for(api_call_task(), timeout=per_attempt_timeout)
 
-                # --- Success ---
                 result = completion.model_dump()
-                if generation:
-                    # Update generation details for the successful attempt
-                    generation.model = current_model_name
-                    generation.end(
-                        output=result,
+                try:
+                    langfuse_context.update_current_observation(
+                        model=current_model_name,
+                        model_parameters={"temperature": 0, "top_p": 1, "max_new_tokens": 8000},
                         usage={
-                            "input": raw.usage_metadata.prompt_token_count,
-                            "output": raw.usage_metadata.candidates_token_count,
+                            "input": getattr(getattr(raw, "usage_metadata", {}), "prompt_token_count", None),
+                            "output": getattr(getattr(raw, "usage_metadata", {}), "candidates_token_count", None),
                         },
-                        level="DEFAULT", # Explicitly set level to DEFAULT for success
-                        status_message=f"Success on attempt {attempt + 1}"
+                        status_message=f"Success on attempt {attempt + 1}",
                     )
+                except Exception:
+                    pass
                 return result, index
 
             except asyncio.TimeoutError:
-                # Update message to reflect the dynamic per-attempt timeout
                 last_status_message = (
-                    f"Attempt {attempt + 1} timed out within {min(default_attempt_timeout, max(0.0, deadline - time.monotonic())):.1f}s "
+                    f"Attempt {attempt + 1} timed out within "
+                    f"{min(default_attempt_timeout, max(0.0, deadline - time.monotonic())):.1f}s "
                     f"(Model: {current_model_name})"
                 )
-                last_exception = asyncio.TimeoutError(last_status_message) # Store exception type
-
             except Exception as e:
                 last_status_message = f"Attempt {attempt + 1} failed (Model: {current_model_name}): {str(e)}, {traceback.format_exc()}"
-                last_exception = e # Store the exception
 
-            # Update generation span for failed attempt if it exists
-            if generation:
-                generation.status_message=last_status_message # Keep updating status message on failures
-                generation.model = current_model_name # Ensure model name reflects the failed attempt
+            try:
+                langfuse_context.update_current_observation(status_message=last_status_message)
+            except Exception:
+                pass
 
-        # --- All attempts failed or deadline exceeded ---
-        if generation:
-            # If the deadline is exceeded, make it clear in the final status
+        try:
             if time.monotonic() > deadline and "Exceeded total timeout" not in last_status_message:
-                last_status_message = (
-                    f"Exceeded total timeout budget of {total_timeout_seconds:.1f}s after {attempt + 1} attempts"
-                )
-            generation.end(
-                output=None,
-                status_message=last_status_message,
-                level="ERROR",
-            )
+                last_status_message = f"Exceeded total timeout budget of {total_timeout_seconds:.1f}s after {attempt + 1} attempts"
+            langfuse_context.update_current_observation(status_message=last_status_message, level="ERROR")
+        except Exception:
+            pass
+
         return None, None
 
-    @trace
+    @observe()
     async def summerizer(
         self,
         classified_files: dict,
-        batch_size: int = 10,  # Smaller batches for better parallelism
-        max_workers: int = 80,  # Number of parallel workers
+        batch_size: int = 10,   # not used for fan-out; kept for compatibility
+        max_workers: int = 80,
         GEMINI_API_KEY: str = "",
         ANTHROPIC_API_KEY: str = "",
         OPENAI_API_KEY: str = "",
-        trace_id: str = ""
-    ) -> str:
-        span = get_langfuse_context().get("span")
-        scores = [0]
-
-        # Use shared client pool for better performance
+    ) -> dict:
+        # clients
         clients, model_names = self._get_or_create_clients(GEMINI_API_KEY, OPENAI_API_KEY)
 
-        # Prepare file lists for each category
+        # group files by category
         files_structure_docstring = []
         files_structure_documentation = []
         files_structure_config = []
 
-        # Keep track of original indices to update the main dict later if needed
-        # or to handle categorization after processing
         original_indices = {}
-
         for index, file in enumerate(classified_files["file_classifications"]):
             file_path = file["file_paths"]
-            file_name = file.get("file_name", "").lower() # Handle potential missing key
-            original_indices[file_path] = index # Store index by file_path
+            file_name = file.get("file_name", "").lower()
+            original_indices[file_path] = index
 
             if "code" in file["classification"].lower() and "ipynb" not in file_path and "__init__.py" not in file_path:
                 files_structure_docstring.append([file_path, "docstring"])
@@ -499,25 +478,22 @@ class InformationCompressorNode(ClassifierConfig):
             elif ".yaml" in file_path.lower() or ".yml" in file_path.lower() or ".yml" in file_name:
                 files_structure_config.append([file_path, "config"])
 
-        # Combine all files to process
         all_files_to_process = files_structure_docstring + files_structure_documentation + files_structure_config
 
-        # Temporary storage for results
         results_docstring = {}
         results_documentation = {}
         results_config = {}
 
-        # Create tasks for all files
+        # schedule tasks
         tasks = []
         file_to_category = {}
-        
         for i, (file_path, category) in enumerate(all_files_to_process):
             client_index = i % len(clients)
             model_name = model_names[client_index]
             client = clients[client_index]
             fallback_clients = [clients[j] for j in range(len(clients)) if j != client_index]
             fallback_model_names = [model_names[j] for j in range(len(clients)) if j != client_index]
-            
+
             if category == "docstring":
                 system_prompt = self.prompts_config["system_docstring"]
                 user_prompt = self.prompts_config["user_docstring"]
@@ -526,7 +502,7 @@ class InformationCompressorNode(ClassifierConfig):
                 system_prompt = self.prompts_config["system_documentation"]
                 user_prompt = self.prompts_config["user_documentation"]
                 log_name = "documentation"
-            else: # category == "config"
+            else:
                 system_prompt = self.prompts_config["system_configuration"]
                 user_prompt = self.prompts_config["user_configuration"]
                 log_name = "config"
@@ -537,9 +513,8 @@ class InformationCompressorNode(ClassifierConfig):
                 model_name,
                 system_prompt,
                 user_prompt,
-                scores,
-                span,
-                file_path, # Pass file_path as identifier instead of original index
+                scores=[0],
+                index=file_path,
                 log_name=log_name,
                 fallback_clients=fallback_clients,
                 fallback_model_names=fallback_model_names,
@@ -547,68 +522,59 @@ class InformationCompressorNode(ClassifierConfig):
             tasks.append(task)
             file_to_category[i] = (file_path, category)
 
-        # Use asyncio.gather with semaphore to limit concurrency
+        # Optional global task cap to avoid memory spikes
         semaphore = asyncio.Semaphore(max_workers)
-        
-        async def bounded_task(task):
+
+        async def bounded(t):
             async with semaphore:
-                return await task
+                return await t
 
-        bounded_tasks = [bounded_task(task) for task in tasks]
-        
-        try:
-            results = await asyncio.gather(*bounded_tasks, return_exceptions=True)
-            
-            for i, result in enumerate(results):
-                file_path, category = file_to_category[i]
-                if isinstance(result, Exception):
-                    continue
-                    
-                processed_result, identifier = result
-                if processed_result and identifier == file_path: # Check if result is valid and matches the file path
-                    if category == "docstring":
-                        results_docstring[file_path] = processed_result
-                    elif category == "documentation":
-                        results_documentation[file_path] = processed_result
-                    elif category == "config":
-                        results_config[file_path] = processed_result
-                        
-        except Exception as e:
-            pass
+        results = await asyncio.gather(*(bounded(t) for t in tasks), return_exceptions=True)
 
-        # Structure the final output
+        # collect
+        for i, result in enumerate(results):
+            file_path, category = file_to_category[i]
+            if isinstance(result, Exception):
+                continue
+            processed_result, identifier = result
+            if processed_result and identifier == file_path:
+                if category == "docstring":
+                    results_docstring[file_path] = processed_result
+                elif category == "documentation":
+                    results_documentation[file_path] = processed_result
+                elif category == "config":
+                    results_config[file_path] = processed_result
+
+        # structure final output
         output_documentation = []
         output_documentation_md = []
         output_config = []
 
         processed_indices = set()
 
-        # Populate docstring results
         for file_path, result in results_docstring.items():
             original_index = original_indices.get(file_path)
             if original_index is not None:
                 file_data = classified_files["file_classifications"][original_index].copy()
                 file_data["documentation"] = result
-                file_data["file_id"] = len(output_documentation) # Assign new sequential ID
+                file_data["file_id"] = len(output_documentation)
                 output_documentation.append(file_data)
                 processed_indices.add(original_index)
 
-        # Populate documentation (.md) results
         for file_path, result in results_documentation.items():
             original_index = original_indices.get(file_path)
             if original_index is not None:
                 file_data = classified_files["file_classifications"][original_index].copy()
-                file_data["documentation"] = result # Add result under 'documentation' key
+                file_data["documentation"] = result
                 file_data["file_id"] = len(output_documentation_md)
                 output_documentation_md.append(file_data)
                 processed_indices.add(original_index)
 
-        # Populate config results
         for file_path, result in results_config.items():
             original_index = original_indices.get(file_path)
             if original_index is not None:
                 file_data = classified_files["file_classifications"][original_index].copy()
-                file_data["documentation_config"] = result # Add result under 'documentation_config' key
+                file_data["documentation_config"] = result
                 file_data["file_id"] = len(output_config)
                 output_config.append(file_data)
                 processed_indices.add(original_index)
@@ -620,47 +586,66 @@ class InformationCompressorNode(ClassifierConfig):
         }
 
 
+# ============================================================
+# Service: sets a larger default executor, runs the 2-stage pipeline
+# ============================================================
 class ClassifierService:
     def __init__(self):
         self.model = None
         self.classifier_node = ClassifierNode()
         self.information_compressor_node = InformationCompressorNode()
-        self.trace_id = generate_trace_id()
-        
-    async def run_pipeline(self, folder_path: str, batch_size: int = 40, max_workers: int = 100, GEMINI_API_KEY: str = "", ANTHROPIC_API_KEY: str = "", OPENAI_API_KEY: str = ""):
-        trace_id = generate_trace_id()
-        # Classifier Node
+        # Thread pool for network-bound SDK calls
+        self._executor = ThreadPoolExecutor(max_workers=int(os.getenv("NETWORK_THREADPOOL", "200")))
+
+    async def run_pipeline(
+        self,
+        folder_path: str,
+        batch_size: int = 40,
+        max_workers: int = 100,
+        GEMINI_API_KEY: str = "",
+        ANTHROPIC_API_KEY: str = "",
+        OPENAI_API_KEY: str = "",
+    ):
+        # Make our big pool the default for run_in_executor / to_thread
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(self._executor)
+
+        # 1) Classification — fan-out; override to per-file by env CLASSIFY_BATCH_SIZE=1
         classifier_result = await self.classifier_node.llmclassifier(
-            folder_path, 
-            batch_size, 
-            max_workers, 
-            GEMINI_API_KEY, 
-            ANTHROPIC_API_KEY, 
-            OPENAI_API_KEY, 
-            trace_id=trace_id 
+            folder_path=folder_path,
+            batch_size=10,  # will be overridden by CLASSIFY_BATCH_SIZE env if set
+            max_workers=100,
+            GEMINI_API_KEY=GEMINI_API_KEY,
+            ANTHROPIC_API_KEY=ANTHROPIC_API_KEY,
+            OPENAI_API_KEY=OPENAI_API_KEY,
         )
-        # Information Compressor Node
+
+        # 2) Summarization/compression — one task per file, bounded by provider + I/O limits
         information_compressor_result = await self.information_compressor_node.summerizer(
-            classifier_result, 
-            batch_size, 
-            max_workers, 
-            GEMINI_API_KEY, 
-            ANTHROPIC_API_KEY, 
-            OPENAI_API_KEY, 
-            trace_id=trace_id  # Pass trace_id explicitly
+            classified_files=classifier_result,
+            batch_size=batch_size,
+            max_workers=100,
+            GEMINI_API_KEY=GEMINI_API_KEY,
+            ANTHROPIC_API_KEY=ANTHROPIC_API_KEY,
+            OPENAI_API_KEY=OPENAI_API_KEY,
         )
         return information_compressor_result
 
 
-
-
-# test
+# ============================================================
+# test harness
+# ============================================================
 if __name__ == "__main__":
     start_time = time.time()
     print(f"Start time: {start_time}")
+
     async def main():
         classifier_service = ClassifierService()
-        result = await classifier_service.run_pipeline("/Users/davidperso/projects/repository_folder/arxflix",GEMINI_API_KEY=os.getenv("GEMINI_API_KEY"))
+        result = await classifier_service.run_pipeline(
+            "/Users/davidperso/freelance/gradio",
+            GEMINI_API_KEY=os.getenv("GEMINI_API_KEY"),
+            OPENAI_API_KEY=os.getenv("OPENAI_API_KEY", ""),
+        )
         print(result)
 
     asyncio.run(main())

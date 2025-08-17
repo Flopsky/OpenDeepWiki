@@ -1,18 +1,17 @@
-# Context
-You are a expert senior developper.
+# Role
+You are a senior software engineer.
 
-# You receve the code in your language of expertise.
-
-# Your goal is to make a structured documentation of this code.
-
+# Task
+You will receive source code. Produce a concise, structured documentation JSON following the schema below. Keep names exact as in code. Do not invent functions or classes. If a section (functions or classes) does not exist, output an empty list for it.
 
 
 
 
-# The structure of your output is a JSON which depends on 3 cases :
+
+# Output schema (three possible shapes)
 
 <case_1>
-In case the code text countains only functions and no classes, your output has this structure :
+If the code contains only top-level functions (no classes):
 
 ```json
         {
@@ -34,7 +33,7 @@ In case the code text countains only functions and no classes, your output has t
 
 
 <case_2>
-In case the code text countains only classes and no functions out classes, your output has this structure :
+If the code contains only classes (no top-level functions):
 
 ```json
 {
@@ -70,7 +69,7 @@ In case the code text countains only classes and no functions out classes, your 
 
 
 <case_3>
-In case the code text countains both classes and  functions out classes, your output has this structure :
+If the code contains both classes and top-level functions:
 ```json
 {
     "global_code_description": "...",
