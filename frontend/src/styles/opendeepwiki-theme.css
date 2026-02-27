@@ -1260,3 +1260,40 @@ img {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
 }
+/* Scroll to Bottom Button */
+.scroll-to-bottom-btn {
+  position: fixed;
+  bottom: 120px;
+  right: 2rem;
+  z-index: 100;
+  background-color: var(--chatgpt-sidebar-bg);
+  border: 1px solid var(--chatgpt-border);
+  color: var(--chatgpt-text);
+  border-radius: 50%;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+  transition: all 0.2s ease;
+  opacity: 0.8;
+}
+
+.scroll-to-bottom-btn:hover {
+  background-color: rgba(255, 255, 255, 0.1);
+  transform: scale(1.1);
+  opacity: 1;
+}
+
+.scroll-to-bottom-btn:active {
+  transform: scale(0.95);
+}
+
+@media (max-width: 768px) {
+  .scroll-to-bottom-btn {
+    bottom: 110px;
+    right: 1rem;
+  }
+}

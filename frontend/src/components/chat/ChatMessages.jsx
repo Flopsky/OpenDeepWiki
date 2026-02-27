@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism';
-import { FiUser, FiCpu, FiCopy, FiCheck, FiInfo } from 'react-icons/fi';
+import { FiUser, FiCpu, FiCopy, FiCheck, FiInfo, FiChevronDown } from 'react-icons/fi';
 
 const ChatMessages = ({ messages }) => {
   const [hoveredMessage, setHoveredMessage] = useState(null);
@@ -374,6 +374,17 @@ const ChatMessages = ({ messages }) => {
         </div>
       ))}
       <div ref={messagesEndRef} style={{ height: '1px', width: '100%' }} />
+
+      {userScrolled && (
+        <button
+          className="scroll-to-bottom-btn"
+          onClick={scrollToBottom}
+          aria-label="Scroll to bottom"
+          title="Scroll to bottom"
+        >
+          <FiChevronDown size={18} />
+        </button>
+      )}
     </div>
   );
 };
